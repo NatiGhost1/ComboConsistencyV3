@@ -911,12 +911,11 @@ impl OsuPerformanceInner<'_> {
                 double_at: 5,
             };
 
-            // TODO: Properly compute per-minute local SR by binning aim/speed
-            // strain peaks. For now we pass an empty slice; relax_marathon_multiplier
-            // returns 1.0 when len < 2, so this is a safe no-op until the
-            // strain-peak plumbing is wired through.
-            let local_sr: Vec<f64> = Vec::new();
-            let mult = relax_marathon_multiplier(&local_sr, params);
+            // CC V3: local_sr_per_minute was precomputed in the difficulty
+            // pipeline (difficulty/mod.rs::difficulty()). relax_marathon_multiplier
+            // returns 1.0 for maps under ~1 minute (len < 2), so short maps are
+            // automatically a no-op.
+            let mult = relax_marathon_multiplier(&self.attrs.local_sr_per_minute, params);
 
             aim_value *= mult;
             speed_value *= mult;

@@ -48,6 +48,10 @@ pub struct OsuDifficultyAttributes {
     pub speed_rework_mult_vanilla: f64,
     /// pre-computed speed rework multiplier (autopilot)
     pub speed_rework_mult_autopilot: f64,
+    /// Per-minute local star rating sequence. Used by the Relax marathon
+    /// decay in performance/mod.rs to detect long stretches of similar
+    /// difficulty. Empty on maps under ~1 minute.
+    pub local_sr_per_minute: Vec<f64>,
 }
 
 impl OsuDifficultyAttributes {

@@ -52,8 +52,13 @@ pub fn difficulty(
         speed_object_data,
     } = DifficultyValues::calculate(difficulty, &map);
 
-    // CC V3: Clone speed object_strains BEFORE .difficulty_value() consumes the speed skill.
-    let speed_object_strains: Vec<f64> = speed.inner.object_strains.clone();
+    // CC V3: Before consuming skills with .difficulty_value(), extract:
+    //   1. speed per-object strains for dominant_tap_bpm
+    //   2. aim + speed section peaks for per-minute local SR (relax marathon)
+    // All extractions are non-consuming (clone internally).
+    let speed_object_strains: Vec<f64> = speed.object_strains().to_vec();
+    let aim_peaks: Vec<f64> = aim.clone_strain_peaks();
+    let speed_peaks: Vec<f64> = speed.clone_strain_peaks();
 
     let aim_difficulty_value = aim.difficulty_value();
     let aim_no_sliders_difficulty_value = aim_no_sliders.difficulty_value();
@@ -87,6 +92,14 @@ pub fn difficulty(
     );
     attrs.speed_rework_mult_vanilla = v_mult;
     attrs.speed_rework_mult_autopilot = ap_mult;
+
+    // CC V3: Bin aim+speed section peaks into per-minute local SR for the
+    // relax marathon decay. Stored on attrs so performance/mod.rs can
+    // read it directly without needing skill access.
+    attrs.local_sr_per_minute = crate::osu::performance::relax_marathon::local_sr_per_minute(
+        &aim_peaks,
+        &speed_peaks,
+    );
 
     Ok(attrs)
 }

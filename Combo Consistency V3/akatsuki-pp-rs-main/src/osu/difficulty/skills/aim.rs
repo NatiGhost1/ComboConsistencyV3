@@ -34,6 +34,10 @@ impl Aim {
         self.inner.get_curr_strain_peaks().strains()
     }
 
+    pub fn clone_strain_peaks(&self) -> Vec<f64> {
+        self.clone().inner.get_curr_strain_peaks().strains().into_vec()
+    }
+
     pub fn difficulty_value(self) -> UsedOsuStrainSkills<DifficultyValue> {
         Self::static_difficulty_value(self.inner)
     }

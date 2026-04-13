@@ -1,3 +1,6 @@
+use crate::osu::difficulty::skills::strain::OsuStrainSkill;
+use crate::osu::performance::PERFORMANCE_BASE_MULTIPLIER
+
 #[derive(Clone, Copy)]
 pub struct MarathonDecayParams {
     pub tau: f64, // tolerance in stars, e.g. 0.50
@@ -10,7 +13,7 @@ pub fn decay_divisor(r: u32, p: MarathonDecayParams) -> f64 {
     let rf = r as f64;
     let base = 1.0 + p.b * rf.powf(p.q);
     if r >= p.double_at {
-        2.0 * base
+        1.3 * base
     } else {
         base
     } 
@@ -66,8 +69,8 @@ let aim_rating = aim_dv.sqrt() * DIFFICULTY_MULTIPLIER;
 let speed_rating = speed_dv.sqrt() * DIFFICULTY_MULTIPLIER;
 
 // convert to "performance"
-let base_aim_perf = crate::difficulty::skills::strain::OsuStrainSkill::difficulty_to_performance(aim_rating);
-let base_speed_perf = crate::difficulty::skills::strain::OsuStrainSkill::difficulty_to_performance(speed_rating);
+let base_aim_perf = OsuStrainSkill::difficulty_to_performance(aim_rating);
+let base_speed_perf = OsuStrainSkill::difficulty_to_performance(speed_rating);
 
     // flashlight ignored for nomod SR (consistent with difficulty eval)
     let base_perf = (base_aim_perf.powf(1.1) + base_speed_perf.powf(1.1)).powf(1.0 / 1.1);
@@ -77,12 +80,12 @@ let base_speed_perf = crate::difficulty::skills::strain::OsuStrainSkill::difficu
     }
 
     // same star mapping used in difficulty::eval
-    crate::PERFORMANCE_BASE_MULTIPLIER.cbrt()
+    PERFORMANCE_BASE_MULTIPLIER.cbrt()
         * 0.027
         * ((100_000.0 / 2.0_f64.powf(1.0 / 1.1) *base_perf).cbrt() + 4.0)
 }
 
-fn local_sr_per_minute(strains_aim: &[f64], strains_speed: &[f64]) -> Vec<f64> {
+pub fn local_sr_per_minute(strains_aim: &[f64], strains_speed: &[f64]) -> Vec<f64> {
     let peaks_per_min = (MINUTE_MS / PEAK_SECTION_LEN_MS).round() as usize; // 150
     let n_minutes = strains_aim.len().div_ceil(peaks_per_min);
 

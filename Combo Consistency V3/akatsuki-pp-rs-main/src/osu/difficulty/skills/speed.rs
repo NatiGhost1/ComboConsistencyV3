@@ -44,6 +44,17 @@ impl Speed {
         self.inner.get_curr_strain_peaks().strains()
     }
 
+    // Non-consuming peak extraction for CC V3. Clones internally
+    pub fn clone_strain_peaks(&self) -> Vec<f64> {
+        self.clone().inner.get_curr_strain_peaks().strains().into_vec()
+    }
+
+    // Non-consuming access to per-object speed strains. Used by CC V3's
+    // dominant_tap_bpm extraction.
+    pub fn object_strains(&self) -> &[f64] {
+        &self.inner.object_strains
+    }
+
     pub fn difficulty_value(self) -> UsedOsuStrainSkills<DifficultyValue> {
         Self::static_difficulty_value(self.inner)
     }
