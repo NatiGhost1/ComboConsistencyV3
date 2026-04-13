@@ -24,6 +24,8 @@ pub struct OsuDifficultyAttributes {
     /// The health drain rate.
     pub hp: f64,
     /// The amount of circles.
+    pub cs: f64,
+    /// circle size
     pub n_circles: u32,
     /// The amount of sliders.
     pub n_sliders: u32,
@@ -52,6 +54,8 @@ pub struct OsuDifficultyAttributes {
     /// decay in performance/mod.rs to detect long stretches of similar
     /// difficulty. Empty on maps under ~1 minute.
     pub local_sr_per_minute: Vec<f64>,
+    pub avg_jump_dist: f64,
+    pub median_delta_time: f64,
 }
 
 impl OsuDifficultyAttributes {

@@ -1021,8 +1021,10 @@ impl OsuPerformanceInner<'_> {
 
         let ar_factor = if self.mods.rx() {
             0.0
-        } else if self.attrs.ar > 10.33 {
-            0.3 * (self.attrs.ar - 10.33)
+        } else if self.attrs.ar > 10.5 {
+            // CC V3: tightened from 10.33 to 10.5 so the buff only fires
+            // on legitimately extreme AR, not on common HR-bumped ARs.
+            0.3 * (self.attrs.ar - 10.5)
         } else if self.attrs.ar < 8.0 {
             0.05 * (8.0 - self.attrs.ar)
         } else {
@@ -1031,6 +1033,76 @@ impl OsuPerformanceInner<'_> {
 
         // * Buff for longer maps with high AR.
         aim_value *= 1.0 + ar_factor * len_bonus;
+
+        // CC V3: AR 10.1–10.5 direct nerf. This band is heavily farmed
+        // (HR on AR 9.x maps, AR 10 maps at DT, etc) and the previous
+        // 10.33 threshold gave partial buffs into the band.
+        if self.attrs.ar > 10.1 && self.attrs.ar <= 10.5 && !self.mods.rx() {
+            // Triangle: 10.1→0.00, 10.3→−6%, 10.5→0.00
+            let mid = 10.3;
+            let half = 0.2;
+            let t = 1.0 - ((self.attrs.ar - mid).abs() / half).min(1.0);
+            let ar_band_nerf = 1.0 - 0.06 * t;
+            aim_value *= ar_band_nerf;
+        }
+
+        // CC V3: CS 4.6–6.4 nerf for mid-BPM 1/2 tapping (120–170 BPM song
+        // BPM). Small circles at lazy tap speeds = a farm profile (small
+        // aim windows, slow enough to predict, OD carries the pp).
+        // 1/2 at 120 BPM → 250 ms delta; 1/2 at 170 BPM → 176 ms delta.
+        // median_delta_time is rate-adjusted, so DT play of a 120–170 song
+        // hits the same delta band.
+        if self.attrs.median_delta_time > 0.0 {
+            let md = self.attrs.median_delta_time;
+            let in_delta_band = md >= 176.0 && md <= 250.0;
+            let cs = self.attrs.cs;
+            if in_delta_band && cs >= 4.6 && cs <= 6.4 {
+                // CS triangle: 4.6→0, 5.5→1, 6.4→0
+                let cs_mid = 5.5;
+                let cs_half = 0.9;
+                let cs_t = 1.0 - ((cs - cs_mid).abs() / cs_half).min(1.0);
+
+                // BPM strength: full nerf around 145 BPM 1/2, less at edges
+                let bpm_1_2 = 30_000.0 / md;
+                let bpm_mid = 145.0;
+                let bpm_half = 25.0;
+                let bpm_t = 1.0 - ((bpm_1_2 - bpm_mid).abs() / bpm_half).min(1.0);
+
+                // Max cut: 10% at CS 5.5 + 145 BPM 1/2
+                let cs_bpm_nerf = 1.0 - 0.10 * cs_t * bpm_t;
+                aim_value *= cs_bpm_nerf;
+            }
+        }
+
+        // CC V3: BPM-based distance inflation nerf for 140–167 BPM nomod
+        // (and the equivalent DT range 210–250.5). Delta_time is
+        // rate-adjusted, so both nomod and DT of a 140–167 song collapse
+        // to the same delta band when interpreted as 1/2.
+        //
+        // bpm_1_2 = 30_000 / median_delta_time
+        // For bpm_1_2 ∈ [140, 167] → median_delta ∈ [179.64, 214.29]
+        //
+        // Combined with high average jump distance (≥180 osu!px avg), this
+        // catches the mid-BPM big-jump farm profile (Christmas Slop, Battle
+        // Tower etc). Triangle penalty peaking at bpm_1_2 = 153.5 and
+        // avg_jump_dist = 260 osu!px.
+        if self.attrs.median_delta_time > 0.0 && self.attrs.avg_jump_dist >= 180.0 {
+            let bpm_1_2 = 30_000.0 / self.attrs.median_delta_time;
+            if bpm_1_2 >= 140.0 && bpm_1_2 <= 167.0 {
+                // BPM triangle: 140→0, 153.5→1, 167→0
+                let bpm_mid = 153.5;
+                let bpm_half = 13.5;
+                let bpm_t = 1.0 - ((bpm_1_2 - bpm_mid).abs() / bpm_half).min(1.0);
+
+                // Distance triangle: 180→0, 260→1, 340+ saturates at 1
+                let dist_t = ((self.attrs.avg_jump_dist - 180.0) / 80.0).clamp(0.0, 1.0);
+
+                // Max cut: 12% at bpm_1_2 = 153.5 with avg_jump_dist ≥ 260
+                let severity = bpm_t * dist_t;
+                let dist_inflation_nerf = 1.0 - 0.12 * severity;
+                aim_value *= dist_inflation_nerf;
+            }
+        }
 
         if self.mods.bl() {
             aim_value *= 1.3
@@ -1185,6 +1257,17 @@ impl OsuPerformanceInner<'_> {
         // * Considering to use derivation from perfect accuracy in a probabilistic manner - assume normal distribution.
         let mut acc_value =
             1.52163_f64.powf(self.attrs.od) * better_acc_percentage.powf(24.0) * 2.83;
+
+        // CC V3: Nerf OD below 9. Low-OD maps were already paying less via
+        // the 1.52163^OD exponential, but the curve is too gentle in the
+        // 7–9 band — OD 8 should lose meaningfully more than a small gap
+        // below OD 9. Taper linearly from ×1.00 at OD 9.0 down to ×0.78
+        // at OD 6.0 and below. OD > 9 is untouched.
+        if self.attrs.od < 9.0 {
+            let below = (9.0 - self.attrs.od).min(3.0);  // clamp: 0..3
+            let od_nerf = 1.0 - 0.073 * below;           // 9→1.00, 8→0.927, 7→0.854, 6→0.781
+            acc_value *= od_nerf;
+        }
 
         // * Bonus for many hitcircles - it's harder to keep good accuracy up for longer.
         acc_value *= (f64::from(amount_hit_objects_with_acc) / 1000.0)

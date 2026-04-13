@@ -101,6 +101,42 @@ pub fn difficulty(
         &speed_peaks,
     );
 
+    // CC V3: Compute average jump distance and median delta time across
+    // all diff objects. Both are rate-adjusted (clock_rate already applied
+    // upstream). Used by the distance inflation nerf in compute_aim_value.
+    if !speed_object_data.is_empty() {
+        // Average pairwise spacing (skip the first object which has no prev).
+        let mut dist_sum = 0.0;
+        let mut dist_count = 0u32;
+        for pair in speed_object_data.windows(2) {
+            let dx = (pair[1].pos_x - pair[0].pos_x) as f64;
+            let dy = (pair[1].pos_y - pair[0].pos_y) as f64;
+            dist_sum += (dx * dx + dy * dy).sqrt();
+            dist_count += 1;
+        }
+        attrs.avg_jump_dist = if dist_count > 0 {
+            dist_sum / dist_count as f64
+        } else {
+            0.0
+        };
+
+        // Median delta_time. Collect positive deltas, sort, pick middle.
+        let mut deltas: Vec<f64> = speed_object_data
+            .iter()
+            .map(|o| o.delta_time)
+            .filter(|d| *d > 0.0)
+            .collect();
+        if !deltas.is_empty() {
+            deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let m = deltas.len() / 2;
+            attrs.median_delta_time = if deltas.len() % 2 == 1 {
+                deltas[m]
+            } else {
+                (deltas[m - 1] + deltas[m]) / 2.0
+            };
+        }
+    }
+
     Ok(attrs)
 }
 
@@ -121,6 +157,7 @@ impl OsuDifficultySetup {
             ar: map_attrs.ar,
             hp: map_attrs.hp,
             od: map_attrs.od,
+            cs: map_attrs.cs,
             ..Default::default()
         };
 
