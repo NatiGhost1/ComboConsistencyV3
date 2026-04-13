@@ -1,0 +1,320 @@
+use std::{cmp, pin::Pin};
+
+use rosu_map::section::general::GameMode;
+use skills::{
+    flashlight::Flashlight,
+    strain::{DifficultyValue, OsuStrainSkill, UsedOsuStrainSkills},
+};
+
+use crate::{
+    any::difficulty::{skills::Skill, Difficulty},
+    model::{beatmap::BeatmapAttributes, mode::ConvertError, mods::GameMods},
+    osu::{
+        convert::convert_objects,
+        difficulty::{object::OsuDifficultyObject, scaling_factor::ScalingFactor},
+        object::OsuObject,
+        performance::PERFORMANCE_BASE_MULTIPLIER,
+    },
+    Beatmap,
+};
+
+use self::skills::OsuSkills;
+
+use super::attributes::OsuDifficultyAttributes;
+
+pub mod gradual;
+mod object;
+pub mod scaling_factor;
+pub mod skills;
+pub mod tap_bpm;
+pub mod speed_precal;
+
+const DIFFICULTY_MULTIPLIER: f64 = 0.0675;
+
+const HD_FADE_IN_DURATION_MULTIPLIER: f64 = 0.4;
+const HD_FADE_OUT_DURATION_MULTIPLIER: f64 = 0.3;
+
+pub fn difficulty(
+    difficulty: &Difficulty,
+    map: &Beatmap,
+) -> Result<OsuDifficultyAttributes, ConvertError> {
+    let map = map.convert_ref(GameMode::Osu, difficulty.get_mods())?;
+
+    let DifficultyValues {
+        skills:
+            OsuSkills {
+                aim,
+                aim_no_sliders,
+                speed,
+                flashlight,
+            },
+        mut attrs,
+        speed_object_data,
+    } = DifficultyValues::calculate(difficulty, &map);
+
+    // CC V3: Clone speed object_strains BEFORE .difficulty_value() consumes the speed skill.
+    let speed_object_strains: Vec<f64> = speed.inner.object_strains.clone();
+
+    let aim_difficulty_value = aim.difficulty_value();
+    let aim_no_sliders_difficulty_value = aim_no_sliders.difficulty_value();
+    let speed_relevant_note_count = speed.relevant_note_count();
+    let speed_difficulty_value = speed.difficulty_value();
+    let flashlight_difficulty_value = flashlight.difficulty_value();
+
+    let mods = difficulty.get_mods();
+
+    DifficultyValues::eval(
+        &mut attrs,
+        mods,
+        &aim_difficulty_value,
+        &aim_no_sliders_difficulty_value,
+        &speed_difficulty_value,
+        speed_relevant_note_count,
+        flashlight_difficulty_value,
+    );
+
+    // CC V3: Compute dominant_tap_bpm from owned data.
+    attrs.dominant_tap_bpm = tap_bpm::dominant_tap_bpm_from_owned(
+        &speed_object_strains,
+        &speed_object_data,
+        0.10,
+    );
+
+    // CC V3: Precompute speed rework multipliers (vanilla + autopilot).
+    let (v_mult, ap_mult) = speed_precal::precompute_speed_rework_from_owned(
+        &speed_object_data,
+        attrs.dominant_tap_bpm,
+    );
+    attrs.speed_rework_mult_vanilla = v_mult;
+    attrs.speed_rework_mult_autopilot = ap_mult;
+
+    Ok(attrs)
+}
+
+pub struct OsuDifficultySetup {
+    scaling_factor: ScalingFactor,
+    map_attrs: BeatmapAttributes,
+    attrs: OsuDifficultyAttributes,
+    time_preempt: f64,
+}
+
+impl OsuDifficultySetup {
+    pub fn new(difficulty: &Difficulty, map: &Beatmap) -> Self {
+        let clock_rate = difficulty.get_clock_rate();
+        let map_attrs = map.attributes().difficulty(difficulty).build();
+        let scaling_factor = ScalingFactor::new(map_attrs.cs);
+
+        let attrs = OsuDifficultyAttributes {
+            ar: map_attrs.ar,
+            hp: map_attrs.hp,
+            od: map_attrs.od,
+            ..Default::default()
+        };
+
+        let time_preempt = f64::from((map_attrs.hit_windows.ar * clock_rate) as f32);
+
+        Self {
+            scaling_factor,
+            map_attrs,
+            attrs,
+            time_preempt,
+        }
+    }
+}
+
+pub struct DifficultyValues {
+    pub skills: OsuSkills,
+    pub attrs: OsuDifficultyAttributes,
+    /// CC V3: Owned per-object data extracted before diff_objects drops,
+    /// used as input to the speed rework precompute pipeline.
+    pub speed_object_data: Vec<tap_bpm::SpeedObjectData>,
+}
+
+impl DifficultyValues {
+    pub fn calculate(difficulty: &Difficulty, map: &Beatmap) -> Self {
+        let mods = difficulty.get_mods();
+        let take = difficulty.get_passed_objects();
+
+        let OsuDifficultySetup {
+            scaling_factor,
+            map_attrs,
+            mut attrs,
+            time_preempt,
+        } = OsuDifficultySetup::new(difficulty, map);
+
+        let mut osu_objects = convert_objects(
+            map,
+            &scaling_factor,
+            mods.reflection(),
+            time_preempt,
+            take,
+            &mut attrs,
+        );
+
+        let osu_object_iter = osu_objects.iter_mut().map(Pin::new);
+
+        let diff_objects =
+            Self::create_difficulty_objects(difficulty, &scaling_factor, osu_object_iter);
+
+        let mut skills = OsuSkills::new(mods, &scaling_factor, &map_attrs, time_preempt);
+
+        {
+            let mut aim = Skill::new(&mut skills.aim, &diff_objects);
+            let mut aim_no_sliders = Skill::new(&mut skills.aim_no_sliders, &diff_objects);
+            let mut speed = Skill::new(&mut skills.speed, &diff_objects);
+            let mut flashlight = Skill::new(&mut skills.flashlight, &diff_objects);
+
+            // The first hit object has no difficulty object
+            let take_diff_objects = cmp::min(map.hit_objects.len(), take).saturating_sub(1);
+
+            for hit_object in diff_objects.iter().take(take_diff_objects) {
+                aim.process(hit_object);
+                aim_no_sliders.process(hit_object);
+                speed.process(hit_object);
+                flashlight.process(hit_object);
+            }
+        }
+
+        // CC V3: Extract owned per-object data before diff_objects drops.
+        let speed_object_data: Vec<tap_bpm::SpeedObjectData> = diff_objects
+            .iter()
+            .map(|obj| tap_bpm::SpeedObjectData {
+                delta_time: obj.delta_time,
+                pos_x: obj.base.pos.x,
+                pos_y: obj.base.pos.y,
+            })
+            .collect();
+
+        Self { skills, attrs, speed_object_data }
+    }
+
+    /// Process the difficulty values and store the results in `attrs`.
+    pub fn eval(
+        attrs: &mut OsuDifficultyAttributes,
+        mods: &GameMods,
+        aim: &UsedOsuStrainSkills<DifficultyValue>,
+        aim_no_sliders: &UsedOsuStrainSkills<DifficultyValue>,
+        speed: &UsedOsuStrainSkills<DifficultyValue>,
+        speed_relevant_note_count: f64,
+        flashlight_difficulty_value: f64,
+    ) {
+        let mut aim_rating = aim.difficulty_value().sqrt() * DIFFICULTY_MULTIPLIER;
+        let aim_rating_no_sliders =
+            aim_no_sliders.difficulty_value().sqrt() * DIFFICULTY_MULTIPLIER;
+        let mut speed_rating = speed.difficulty_value().sqrt() * DIFFICULTY_MULTIPLIER;
+        let mut flashlight_rating = flashlight_difficulty_value.sqrt() * DIFFICULTY_MULTIPLIER;
+
+        let slider_factor = if aim_rating > 0.0 {
+            aim_rating_no_sliders / aim_rating
+        } else {
+            1.0
+        };
+
+        let aim_difficult_strain_count = aim.count_difficult_strains();
+        let speed_difficult_strain_count = speed.count_difficult_strains();
+
+        if mods.td() {
+            aim_rating = aim_rating.powf(0.6);
+            flashlight_rating = flashlight_rating.powf(0.7);
+        }
+
+        if mods.rx() {
+            aim_rating *= 0.85; // no tap
+            speed_rating = 0.0;
+            flashlight_rating *= 0.7; // cant see shi
+        }
+
+        if mods.ap() {
+            aim_rating = 0.0;
+            speed_rating = 1.0; // speed calc change not needed
+            flashlight_rating *= 0.55; // cant see shi
+        }
+
+        // Buffs 4 mod (Not EZ)
+        if mods.ap() && mods.dt() && mods.hd() && mods.hr() && mods.fl() && !mods.ez() {
+            aim_rating = 0.0;
+            speed_rating = 1.0; // speed calc change not needed
+            flashlight_rating *= 0.72;
+        }
+
+        // Assumes all 4-mod TD scores are auto and removes touch device nerf
+        if mods.td() && mods.dt() && mods.hd() && mods.hr() && mods.fl() && !mods.ez() && !mods.rx() && !mods.ap() {
+            aim_rating = aim_rating.powf(1.0);
+            flashlight_rating = flashlight_rating.powf(1.0);
+        }
+
+        if mods.td() && mods.dt() && mods.hd() && mods.hr() && mods.fl() && mods.rx() && !mods.ez() && !mods.ap() {
+            aim_rating = aim_rating.powf(1.0);
+            flashlight_rating = flashlight_rating.powf(1.0);
+        }
+
+        let base_aim_performance = OsuStrainSkill::difficulty_to_performance(aim_rating);
+        let base_speed_performance = OsuStrainSkill::difficulty_to_performance(speed_rating);
+
+        let base_flashlight_performance = if mods.fl() {
+            Flashlight::difficulty_to_performance(flashlight_rating)
+        } else {
+            0.0
+        };
+
+        let base_performance = ((base_aim_performance).powf(1.1)
+            + (base_speed_performance).powf(1.1)
+            + (base_flashlight_performance).powf(1.1))
+        .powf(1.0 / 1.1);
+
+        let star_rating = if base_performance > 0.00001 {
+            PERFORMANCE_BASE_MULTIPLIER.cbrt()
+                * 0.027
+                * ((100_000.0 / 2.0_f64.powf(1.0 / 1.1) * base_performance).cbrt() + 4.0)
+        } else {
+            0.0
+        };
+
+        attrs.aim = aim_rating;
+        attrs.speed = speed_rating;
+        attrs.flashlight = flashlight_rating;
+        attrs.slider_factor = slider_factor;
+        attrs.aim_difficult_strain_count = aim_difficult_strain_count;
+        attrs.speed_difficult_strain_count = speed_difficult_strain_count;
+        attrs.stars = star_rating;
+        attrs.speed_note_count = speed_relevant_note_count;
+    }
+
+    pub fn create_difficulty_objects<'a>(
+        difficulty: &Difficulty,
+        scaling_factor: &ScalingFactor,
+        osu_objects: impl ExactSizeIterator<Item = Pin<&'a mut OsuObject>>,
+    ) -> Vec<OsuDifficultyObject<'a>> {
+        let take = difficulty.get_passed_objects();
+        let clock_rate = difficulty.get_clock_rate();
+
+        let mut osu_objects_iter = osu_objects
+            .map(|h| OsuDifficultyObject::compute_slider_cursor_pos(h, scaling_factor.radius))
+            .map(Pin::into_ref);
+
+        let Some(mut last) = osu_objects_iter.next().filter(|_| take > 0) else {
+            return Vec::new();
+        };
+
+        let mut last_last = None;
+
+        osu_objects_iter
+            .enumerate()
+            .map(|(idx, h)| {
+                let diff_object = OsuDifficultyObject::new(
+                    h.get_ref(),
+                    last.get_ref(),
+                    last_last.as_deref(),
+                    clock_rate,
+                    idx,
+                    scaling_factor,
+                );
+
+                last_last = Some(last);
+                last = h;
+
+                diff_object
+            })
+            .collect()
+    }
+}
