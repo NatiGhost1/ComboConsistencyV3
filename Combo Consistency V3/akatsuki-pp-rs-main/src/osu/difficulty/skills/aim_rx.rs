@@ -101,6 +101,12 @@ impl AimRxEvaluator {
     // and don't get nerfed.
     const CONSTANT_DIST_BPM_STRAIN_TIME: f64 = 85.7;
 
+    // BPM condition for the extreme-flow nerf. 410 BPM 1/4 → 
+    // strain_time = 60000 / (410 * 4) ≈ 35.58 ms. Above that effective
+    // BPM (i.e. strain_time < 35.58), these patterns are actually hard
+    // and don't get nerfed.
+    const FLOW_CONSTANT_DIST_BPM_STRAIN_TIME: f64 = 36.58
+
     // Windowed angle variance: number of previous diff objects to sample
     // when computing variance. 6 covers ~1.5 beats at moderate tempo —
     // long enough to see a real pattern, short enough that unrelated
@@ -334,9 +340,9 @@ impl AimRxEvaluator {
         //   - stddev → 0 (perfectly smooth curve) + mean → π  = full −50%
         //   - stddev at threshold or mean at threshold = no nerf
         //
-        // Exempt above 350 BPM 1/2 effective — at that speed, flow is
+        // Exempt above 410 BPM 1/4 effective — at that speed, flow is
         // actually mechanically hard to execute on RX.
-        if osu_curr_obj.strain_time >= Self::CONSTANT_DIST_BPM_STRAIN_TIME {
+        if osu_curr_obj.strain_time >= Self::FLOW_CONSTANT_DIST_BPM_STRAIN_TIME {
             let (flow_mean, flow_stddev, flow_n) =
                 windowed_angle_stats(osu_curr_obj, diff_objects, Self::ANGLE_WINDOW);
 
