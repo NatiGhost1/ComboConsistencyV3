@@ -269,33 +269,22 @@ impl DifficultyValues {
         }
 
         if mods.rx() {
-            aim_rating *= 0.85; // no tap
+            aim_rating = 1.0;
             speed_rating = 0.0;
-            flashlight_rating *= 0.7; // cant see shi
+            flashlight_rating *= 0.7; 
         }
 
         if mods.ap() {
             aim_rating = 0.0;
-            speed_rating = 1.0; // speed calc change not needed
-            flashlight_rating *= 0.55; // cant see shi
+            speed_rating = 1.0;
+            flashlight_rating *= 0.55; 
         }
 
         // Buffs 4 mod (Not EZ)
         if mods.ap() && mods.dt() && mods.hd() && mods.hr() && mods.fl() && !mods.ez() {
             aim_rating = 0.0;
-            speed_rating = 1.0; // speed calc change not needed
+            speed_rating = 1.0;
             flashlight_rating *= 0.72;
-        }
-
-        // Assumes all 4-mod TD scores are auto and removes touch device nerf
-        if mods.td() && mods.dt() && mods.hd() && mods.hr() && mods.fl() && !mods.ez() && !mods.rx() && !mods.ap() {
-            aim_rating = aim_rating.powf(1.0);
-            flashlight_rating = flashlight_rating.powf(1.0);
-        }
-
-        if mods.td() && mods.dt() && mods.hd() && mods.hr() && mods.fl() && mods.rx() && !mods.ez() && !mods.ap() {
-            aim_rating = aim_rating.powf(1.0);
-            flashlight_rating = flashlight_rating.powf(1.0);
         }
 
         let base_aim_performance = OsuStrainSkill::difficulty_to_performance(aim_rating);

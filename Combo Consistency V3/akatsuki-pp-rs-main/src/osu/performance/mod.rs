@@ -983,8 +983,14 @@ impl OsuPerformanceInner<'_> {
     if map_max_combo <= 250 && self.mods.fl() && self.mods.hr() && self.mods.dt() && self.mods.hd() && self.mods.ap() { p -= 0.18; }
 
     // Each miss becomes progressively more punishing.
-    // V1.1 uses exponent 1.5 (was 1.3 in earlier versions) for harsher scaling.
-    let miss_weight = misses.powf(1.5);
+    // V1.1 uses exponent 1.5 as the base; 2+ misses ramps to 1.7 for
+    // harsher scaling when the player starts actually dropping notes.
+    let miss_exp = if misses >= 10.0 { 2.4 } 
+    else if misses >= 6.0 { 2.3 } 
+    else if misses >= 4.0 { 2.1 } 
+    else if misses >= 2.0 { 1.7 } 
+    else { 1.5 };
+    let miss_weight = misses.powf(miss_exp);
 
     // * MISS WEIGHTING
     p.powf(miss_weight)

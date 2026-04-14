@@ -17,14 +17,19 @@ const STRAIN_DECAY_BASE: f64 = 0.15;
 #[derive(Clone)]
 pub struct Aim {
     with_sliders: bool,
+    /// CC V3: Relax-specific evaluator dispatch flag. When true,
+    /// strain_value_at routes to AimRxEvaluator in aim_rx.rs instead
+    /// of the vanilla AimEvaluator below.
+    has_relax: bool,
     curr_strain: f64,
     inner: OsuStrainSkill,
 }
 
 impl Aim {
-    pub fn new(with_sliders: bool) -> Self {
+    pub fn new(with_sliders: bool, has_relax: bool) -> Self {
         Self {
             with_sliders,
+            has_relax,
             curr_strain: 0.0,
             inner: OsuStrainSkill::default(),
         }
@@ -34,6 +39,11 @@ impl Aim {
         self.inner.get_curr_strain_peaks().strains()
     }
 
+    /// Non-consuming peak extraction. Clones the skill internally and
+    /// returns the current saved section peaks as a plain Vec<f64>.
+    /// Used by CC V3's relax_marathon decay to bin peaks into per-minute
+    /// local SR without consuming the skill (so .difficulty_value() can
+    /// still be called afterwards).
     pub fn clone_strain_peaks(&self) -> Vec<f64> {
         self.clone().inner.get_curr_strain_peaks().strains().into_vec()
     }
@@ -105,9 +115,21 @@ impl<'a> Skill<'a, Aim> {
 
     fn strain_value_at(&mut self, curr: &'a OsuDifficultyObject<'a>) -> f64 {
         self.inner.curr_strain *= strain_decay(curr.delta_time, STRAIN_DECAY_BASE);
-        self.inner.curr_strain +=
+
+        // CC V3: dispatch to the Relax-specific evaluator when the flag
+        // is set. Same signature and contract as AimEvaluator — returns
+        // an aim strain contribution for this diff object.
+        let eval_result = if self.inner.has_relax {
+            super::aim_rx::AimRxEvaluator::evaluate_diff_of(
+                curr,
+                self.diff_objects,
+                self.inner.with_sliders,
+            )
+        } else {
             AimEvaluator::evaluate_diff_of(curr, self.diff_objects, self.inner.with_sliders)
-                * SKILL_MULTIPLIER;
+        };
+
+        self.inner.curr_strain += eval_result * SKILL_MULTIPLIER;
         self.inner.inner.object_strains.push(self.inner.curr_strain);
 
         self.inner.curr_strain

@@ -8,6 +8,7 @@ use self::{aim::Aim, flashlight::Flashlight, speed::Speed};
 use super::{scaling_factor::ScalingFactor, HD_FADE_IN_DURATION_MULTIPLIER};
 
 pub mod aim;
+pub mod aim_rx;
 pub mod flashlight;
 pub mod speed;
 pub mod strain;
@@ -42,8 +43,13 @@ impl OsuSkills {
             400.0 * (time_preempt / OsuObject::PREEMPT_MIN).min(1.0)
         };
 
-        let aim = Aim::new(true);
-        let aim_no_sliders = Aim::new(false);
+        // CC V3: Relax gets a separate aim evaluator (see skills/aim_rx.rs).
+        // Both aim skills receive the flag so the with_sliders and
+        // no_sliders variants use the same evaluator path.
+        let has_relax = mods.rx();
+
+        let aim = Aim::new(true, has_relax);
+        let aim_no_sliders = Aim::new(false, has_relax);
         let speed = Speed::new(hit_window, mods);
         let flashlight = Flashlight::new(mods, scaling_factor.radius, time_preempt, time_fade_in);
 
