@@ -823,27 +823,12 @@ impl OsuPerformanceInner<'_> {
 
         let mut multiplier = PERFORMANCE_BASE_MULTIPLIER;
 
-        let mut rx_base_nerf = 0.86 * 1.15;
-
         if self.mods.nf() {
             multiplier *= (1.0 - 0.02 * self.effective_miss_count).max(0.9);
         }
 
         if self.mods.so() && total_hits > 0.0 {
             multiplier *= 1.0 - (f64::from(self.attrs.n_spinners) / total_hits).powf(0.85);
-        }
-
-        //GOALS//
-        // * (OVERALL) punish rx scores with 3 or more effective misses (later this will be OD based)
-        // * make rx scores with 3-10 effective misses worth less than or more closely to scores on vanilla
-        // * (MIGHT REMOVE) rx scores over 10 effective misses multiply base rx nerf by .91 (base mult becomes ~0.9) 
-
-        if self.mods.rx() && self.effective_miss_count >= 3.0 && self.effective_miss_count <= 10 {
-            multiplier *= rx_base_nerf;
-        }
-        
-        if self.mods.rx() && self.effective_miss_count > 10 {
-            multiplier *= rx_base_nerf * 0.91;
         }
 
         if self.mods.rx() {
@@ -985,12 +970,24 @@ impl OsuPerformanceInner<'_> {
     // Each miss becomes progressively more punishing.
     // V1.1 uses exponent 1.5 as the base; 2+ misses ramps to 1.7 for
     // harsher scaling when the player starts actually dropping notes.
-    let miss_exp = if misses >= 10.0 { 2.4 } 
+    let miss_exp = if misses >= 14.0 { 2.4 } 
     else if misses >= 6.0 { 2.3 } 
     else if misses >= 4.0 { 2.1 } 
     else if misses >= 2.0 { 1.7 } 
     else { 1.5 };
-    let miss_weight = misses.powf(miss_exp);
+
+    // Less harsh for longer maps
+    let mara_miss_exp = if misses >= 16.0 { 2.3 }
+    else if misses >= 6.0 { 2.1 }
+    else if misses >= 4.0 { 1.9 }
+    else { 1.5 };
+    
+    let miss_weight = if map_max_combo >= 2000.0 {
+        misses.powf(mara_miss_exp)
+    } else {
+        misses.powf(miss_exp)
+    };
+    
 
     // * MISS WEIGHTING
     p.powf(miss_weight)
