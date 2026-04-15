@@ -1,0 +1,29 @@
+[package]
+name = "combo-consistency"
+version = "1.1"
+edition = "2026"
+authors = ["MaxOhn <ohn.m@hotmail.de>", "tsunyoku <tsunyoku@gmail.com>", "NatiGhost1 <josh.miller83@outlook.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/NatiGhost1/ComboConsistencyV3"
+description = "Performance point calculation for osu! built off of akatsuki-pp"
+keywords = ["osu", "pp", "stars", "performance", "difficulty"]
+
+[features]
+default = []
+raw_strains = []
+sync = []
+tracing = ["rosu-map/tracing"]
+
+[dependencies]
+rosu-map = { version = "0.2.0" }
+rosu-mods = { version = "0.2.0" }
+
+[dev-dependencies]
+proptest = "1.4.0"
+
+[profile.test.package.proptest]
+opt-level = 3
+
+[profile.test.package.rand_chacha]
+opt-level = 3
