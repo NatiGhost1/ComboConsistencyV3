@@ -86,6 +86,8 @@ impl<'map> OsuPerformance<'map> {
         }
     }
 
+    
+
     /// Attempt to convert the map to the specified mode.
     ///
     /// Returns `Err(self)` if no beatmap is contained, i.e. if this
