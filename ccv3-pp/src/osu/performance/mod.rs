@@ -24,8 +24,7 @@ pub mod relax_marathon;
 pub mod speed_rework;
 
 use relax_marathon::{relax_marathon_multiplier, MarathonDecayParams};
-
-use speed_rework::{compute_vanilla_speed_multiplier, compute_autopilot_speed_multiplier, SpeedReworkParams,};
+use speed_rework::{compute_autopilot_speed_multiplier, compute_vanilla_speed_multiplier, SpeedReworkParams};
 
 /// Performance calculator on osu!standard maps.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,9 +43,6 @@ pub struct OsuPerformance<'map> {
     pub(crate) hitresult_priority: HitResultPriority, 
     pub(crate) combo_consistency_v3_p: Option<f64>,
     pub(crate) disable_combo_scaling: bool,
-    //this is used to disable combo scaling so the rework wont interfere with Combo scaling removal
-    //disabling combo scaling entirely is extremely important because combo consistency interferes with csr and would make combo position based again j
-    
 }
 
 impl<'map> OsuPerformance<'map> {
@@ -85,8 +81,6 @@ impl<'map> OsuPerformance<'map> {
             None
         }
     }
-
-    
 
     /// Attempt to convert the map to the specified mode.
     ///
@@ -360,10 +354,10 @@ impl<'map> OsuPerformance<'map> {
 
     /// - Enable combo consistency v3;
     pub fn combo_consistency_v3(mut self, p: f64) -> Self {
-    self.disable_combo_scaling = true;
-    self.combo_consistency_v3_p = Some(p);
-    self
-}
+        self.disable_combo_scaling = true;
+        self.combo_consistency_v3_p = Some(p);
+        self
+    }
 
     /// Create the [`OsuScoreState`] that will be used for performance calculation.
     #[allow(clippy::too_many_lines)]
@@ -846,8 +840,6 @@ impl OsuPerformanceInner<'_> {
                 (1.0, 1.0)
             };
 
-
-        
             // * As we're adding Oks and Mehs to an approximated number of combo breaks the result can be
             // * higher than total hits in specific scenarios (which breaks some calculations) so we need to clamp it.
             self.effective_miss_count = (self.effective_miss_count
@@ -857,35 +849,35 @@ impl OsuPerformanceInner<'_> {
         }
 
         let mut aim_value = self.compute_aim_value();
-        
-        //* New Speed Calculation *//
+
+        // * New Speed Calculation
         let mut speed_value = self.compute_speed_value();
 
         let speed_mult = if self.mods.ap() {
-        if self.attrs.speed_rework_mult_autopilot > 0.0 {
-            self.attrs.speed_rework_mult_autopilot
+            if self.attrs.speed_rework_mult_autopilot > 0.0 {
+                self.attrs.speed_rework_mult_autopilot
+            } else {
+                // Fallback: compute live if difficulty pipeline didn't store it
+                // (e.g. when using pre-computed attrs from an older cache)
+                compute_autopilot_speed_multiplier(
+                    &[], // empty slice triggers safe fallback in rework
+                    self.attrs.dominant_tap_bpm,
+                    &SpeedReworkParams::default(),
+                )
+            }
         } else {
-            // Fallback: compute live if difficulty pipeline didn't store it
-            // (e.g. when using pre-computed attrs from an older cache)
-            compute_autopilot_speed_multiplier(
-                &[], // empty slice triggers safe fallback in rework
-                self.attrs.dominant_tap_bpm,
-                &SpeedReworkParams::default(),
-            )
-        }
-    } else {
-        if self.attrs.speed_rework_mult_vanilla > 0.0 {
-            self.attrs.speed_rework_mult_vanilla
-        } else {
-            compute_vanilla_speed_multiplier(
-                &[],
-                self.attrs.dominant_tap_bpm,
-                &SpeedReworkParams::default(),
-            )
-        }
-    };
+            if self.attrs.speed_rework_mult_vanilla > 0.0 {
+                self.attrs.speed_rework_mult_vanilla
+            } else {
+                compute_vanilla_speed_multiplier(
+                    &[],
+                    self.attrs.dominant_tap_bpm,
+                    &SpeedReworkParams::default(),
+                )
+            }
+        };
 
-    speed_value *= speed_mult;
+        speed_value *= speed_mult;
 
         let acc_value = self.compute_accuracy_value();
         let mut flashlight_value = self.compute_flashlight_value();
@@ -969,50 +961,72 @@ impl OsuPerformanceInner<'_> {
         }
     }
 
-    // * Combo Consistency Multiplier 
+    // * Combo Consistency Multiplier
     fn apply_cc_v3_multiplier(&self) -> f64 {
         let misses = self.effective_miss_count;
         if misses <= 0.0 {
-        return 1.0;
-    }
-   
-    let map_max_combo = self.attrs.max_combo;
-    let mut p = 0.998;
+            return 1.0;
+        }
 
-    // Apply existing logic for mods
-    if self.mods.rx() { p -= 0.02; }
-    if self.mods.ap() { p -= 0.05; }
-    if self.mods.dt() && self.mods.hr() { p += 0.0025; }
-    if self.mods.dt() && self.mods.ez() { p += 0.0028; }
-    // * OVERWEIGHTED FARM/AIMSLOP NERF
-    if map_max_combo <= 500 && self.mods.dt() { p -= 0.02; }
-    if map_max_combo <= 500 && self.mods.dt() && self.mods.hr() { p -= 0.01; }
-    if map_max_combo <= 500 && self.mods.rx() { p -= 0.03; }
+        let map_max_combo = self.attrs.max_combo;
+        let mut p = 0.998;
 
-    // Each miss becomes progressively more punishing.
-    // V1.1 uses exponent 1.5 as the base; 2+ misses ramps to 1.7 for
-    // harsher scaling when the player starts actually dropping notes.
-    let miss_exp = if misses >= 14.0 { 2.4 } 
-    else if misses >= 6.0 { 2.3 } 
-    else if misses >= 4.0 { 2.1 } 
-    else if misses >= 2.0 { 1.7 } 
-    else { 1.5 };
+        if self.mods.rx() {
+            p -= 0.02;
+        }
+        if self.mods.ap() {
+            p -= 0.05;
+        }
+        if self.mods.dt() && self.mods.hr() {
+            p += 0.0025;
+        }
+        if self.mods.dt() && self.mods.ez() {
+            p += 0.0028;
+        }
+        if map_max_combo <= 500 && self.mods.dt() {
+            p -= 0.02;
+        }
+        if map_max_combo <= 500 && self.mods.dt() && self.mods.hr() {
+            p -= 0.01;
+        }
+        if map_max_combo <= 500 && self.mods.rx() {
+            p -= 0.03;
+        }
 
-    // Less harsh for longer maps
-    let mara_miss_exp = if misses >= 16.0 { 2.3 }
-    else if misses >= 6.0 { 2.1 }
-    else if misses >= 4.0 { 1.9 }
-    else { 1.5 };
-    
-    let miss_weight = if map_max_combo >= 2000 {
-        misses.powf(mara_miss_exp)
-    } else {
-        misses.powf(miss_exp)
-    };
-    
+        // Each miss becomes progressively more punishing.
+        // V1.1 uses exponent 1.5 as the base; 2+ misses ramps to 1.7 for
+        // harsher scaling when the player starts actually dropping notes.
+        let miss_exp = if misses >= 14.0 {
+            2.4
+        } else if misses >= 6.0 {
+            2.3
+        } else if misses >= 4.0 {
+            2.1
+        } else if misses >= 2.0 {
+            1.7
+        } else {
+            1.5
+        };
 
-    // * MISS WEIGHTING
-    p.powf(miss_weight)
+        // Less harsh for longer maps
+        let mara_miss_exp = if misses >= 16.0 {
+            2.3
+        } else if misses >= 6.0 {
+            2.1
+        } else if misses >= 4.0 {
+            1.9
+        } else {
+            1.5
+        };
+
+        let miss_weight = if map_max_combo >= 2000 {
+            misses.powf(mara_miss_exp)
+        } else {
+            misses.powf(miss_exp)
+        };
+
+        // * MISS WEIGHTING
+        p.powf(miss_weight)
     }
 
     /// CC V3 Relax-only: accuracy-drop-based miss weighting.
@@ -1073,13 +1087,12 @@ impl OsuPerformanceInner<'_> {
                 self.effective_miss_count,
                 self.attrs.aim_difficult_strain_count,
             );
-            }   else if self.mods.fl() && self.mods.dt() && self.mods.hd() && self.mods.hr() {
-                    aim_value *= Self::calculate_miss_penalty(
-                        self.misses,
-                        self.attrs.aim_difficult_strain_count,
+        } else if self.mods.fl() && self.mods.dt() && self.mods.hd() && self.mods.hr() {
+            aim_value *= Self::calculate_miss_penalty(
+                self.misses,
+                self.attrs.aim_difficult_strain_count,
             );
             // ^ Calculates all 4-mod scores using raw misses instead of effective misses ^ //
-            
         }
 
         let ar_factor = if self.mods.rx() {
