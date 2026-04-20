@@ -932,22 +932,31 @@ impl OsuPerformanceInner<'_> {
         // which means 100s and 50s are a much cleaner signal for "where on
         // the difficulty spectrum did the miss happen" than combo position.
         // This applies a small additional multiplier based on the map's
-        // effective hardness as measured by the weighted hit distribution:
+        // effective hardness as measured by the weighted hit distribution.
         //
-        //   - hard map (avg weight per note < 0.90): 0.75x
-        //     (miss likely in a genuinely difficult section → less punished)
-        //   - easy map (avg weight per note >= 0.90): 0.50x
-        //     (miss was probably a sloppy break → more punished)
+        // Misses decay with each additional miss: first miss has full penalty,
+        // but subsequent misses apply diminishing penalties.
         //
         // Only runs when there is at least 1 miss, and only for Relax.
         if self.mods.rx() && self.effective_miss_count > 0.0 {
-            let acc_drop_weight = self.accuracy_drop_based_miss_weight();
+            let base_weight = self.accuracy_drop_based_miss_weight();
+            let num_misses = self.effective_miss_count.ceil() as u32;
 
-            pp *= acc_drop_weight;
-            aim_value *= acc_drop_weight;
-            speed_value *= acc_drop_weight;
-            acc_value *= acc_drop_weight;
-            flashlight_value *= acc_drop_weight;
+            // Decay factor: each additional miss has this fraction of the previous miss penalty
+            let decay_per_miss = 0.70;
+            let mut total_weight = 1.0;
+
+            for i in 0..num_misses {
+                // Apply decay: 1st miss full penalty, 2nd miss 70% penalty, 3rd miss 70% of that, etc.
+                let miss_weight = 1.0 - (1.0 - base_weight) * decay_per_miss.powi(i as i32);
+                total_weight *= miss_weight;
+            }
+
+            pp *= total_weight;
+            aim_value *= total_weight;
+            speed_value *= total_weight;
+            acc_value *= total_weight;
+            flashlight_value *= total_weight;
         }
 
         OsuPerformanceAttributes {
