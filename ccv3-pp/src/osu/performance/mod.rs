@@ -988,10 +988,6 @@ impl OsuPerformanceInner<'_> {
     if map_max_combo <= 500 && self.mods.dt() { p -= 0.02; }
     if map_max_combo <= 500 && self.mods.dt() && self.mods.hr() { p -= 0.01; }
     if map_max_combo <= 500 && self.mods.rx() { p -= 0.03; }
-    // * ONL FARM NERF (cheat servers)
-    if map_max_combo <= 250 && self.mods.fl() && self.mods.hr() && self.mods.dt() && self.mods.hd() { p -= 0.1; }
-    if map_max_combo <= 250 && self.mods.fl() && self.mods.hr() && self.mods.dt() && self.mods.hd() && self.mods.rx() { p -= 0.12; }
-    if map_max_combo <= 250 && self.mods.fl() && self.mods.hr() && self.mods.dt() && self.mods.hd() && self.mods.ap() { p -= 0.18; }
 
     // Each miss becomes progressively more punishing.
     // V1.1 uses exponent 1.5 as the base; 2+ misses ramps to 1.7 for
