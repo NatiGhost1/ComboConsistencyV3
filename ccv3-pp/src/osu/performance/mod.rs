@@ -1043,7 +1043,7 @@ impl OsuPerformanceInner<'_> {
     fn accuracy_drop_based_miss_weight(&self) -> f64 {
         let total_hits = f64::from(self.state.total_hits());
         if total_hits == 0.0 {
-            return 0.5;
+            return 0.70;
         }
 
         // Weights: n300 = 1.0, n100 = 0.9, n50 = 0.85
@@ -1056,15 +1056,10 @@ impl OsuPerformanceInner<'_> {
         // Average weight per note in [0.85, 1.0] roughly
         let avg_weight_per_note = (actual_weighted_sum / total_hits).min(1.0);
 
-        // Hardness heuristic: lots of 100s/50s means the map played hard,
-        // so the miss was probably in a legitimately difficult spot.
-        let is_hard_map = avg_weight_per_note < 0.90;
-
-        if is_hard_map {
-            0.75
-        } else {
-            0.50
-        }
+        // Smooth gradient from 0.75 (hard map) to 0.70 (easy map)
+        // Maps avg_weight_per_note from [0.85, 1.0] to penalty [0.75, 0.70]
+        let penalty = 0.75 - (avg_weight_per_note - 0.85) / 3.0;
+        penalty.max(0.70)
     }
 
     fn compute_aim_value(&self) -> f64 {
