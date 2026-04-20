@@ -936,20 +936,41 @@ impl OsuPerformanceInner<'_> {
         //
         // Misses decay with each additional miss: first miss has full penalty,
         // but subsequent misses apply diminishing penalties.
+        // When miss count exceeds 2, the penalty becomes much less extreme.
         //
         // Only runs when there is at least 1 miss, and only for Relax.
         if self.mods.rx() && self.effective_miss_count > 0.0 {
             let base_weight = self.accuracy_drop_based_miss_weight();
             let num_misses = self.effective_miss_count.ceil() as u32;
-
-            // Decay factor: each additional miss has this fraction of the previous miss penalty
-            let decay_per_miss = 0.70;
             let mut total_weight = 1.0;
 
-            for i in 0..num_misses {
-                // Apply decay: 1st miss full penalty, 2nd miss 70% penalty, 3rd miss 70% of that, etc.
-                let miss_weight = 1.0 - (1.0 - base_weight) * decay_per_miss.powi(i as i32);
-                total_weight *= miss_weight;
+            // Decay strategy depends on miss count
+            if self.effective_miss_count > 2.0 {
+                // For 3+ misses: use much gentler decay (each miss adds 10% penalty, caps at moderate loss)
+                for i in 0..num_misses {
+                    let penalty_reduction = if i == 0 {
+                        (1.0 - base_weight) // First miss: full penalty based on map hardness
+                    } else {
+                        (1.0 - base_weight) * 0.10 // Subsequent misses: only 10% penalty each
+                    };
+                    let miss_weight = 1.0 - penalty_reduction;
+                    total_weight *= miss_weight;
+                }
+            } else {
+                // For 1-2 misses: use aggressive first decay (easy map 70%, hard map 35%)
+                for i in 0..num_misses {
+                    let decay_factor = if i == 0 {
+                        1.0 // First miss: full penalty
+                    } else if base_weight >= 0.72 {
+                        0.35 // Easy map: 35% of penalty for subsequent misses
+                    } else {
+                        0.15 // Hard map: 15% of penalty for subsequent misses
+                    };
+
+                    let penalty_reduction = (1.0 - base_weight) * decay_factor;
+                    let miss_weight = 1.0 - penalty_reduction;
+                    total_weight *= miss_weight;
+                }
             }
 
             pp *= total_weight;
