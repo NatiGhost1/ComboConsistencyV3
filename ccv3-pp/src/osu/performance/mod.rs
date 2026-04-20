@@ -934,6 +934,30 @@ impl OsuPerformanceInner<'_> {
             flashlight_value *= scale;
         }
 
+        // CC V3: Relax-only accuracy-drop based miss weighting.
+        //
+        // Ported from cheat-ccv3-pp. On Relax, the player has no tap timing,
+        // which means 100s and 50s are a much cleaner signal for "where on
+        // the difficulty spectrum did the miss happen" than combo position.
+        // This applies a small additional multiplier based on the map's
+        // effective hardness as measured by the weighted hit distribution:
+        //
+        //   - hard map (avg weight per note < 0.90): 0.75x
+        //     (miss likely in a genuinely difficult section → less punished)
+        //   - easy map (avg weight per note >= 0.90): 0.50x
+        //     (miss was probably a sloppy break → more punished)
+        //
+        // Only runs when there is at least 1 miss, and only for Relax.
+        if self.mods.rx() && self.effective_miss_count > 0.0 {
+            let acc_drop_weight = self.accuracy_drop_based_miss_weight();
+
+            pp *= acc_drop_weight;
+            aim_value *= acc_drop_weight;
+            speed_value *= acc_drop_weight;
+            acc_value *= acc_drop_weight;
+            flashlight_value *= acc_drop_weight;
+        }
+
         OsuPerformanceAttributes {
             difficulty: self.attrs,
             pp_acc: acc_value,
@@ -993,6 +1017,44 @@ impl OsuPerformanceInner<'_> {
 
     // * MISS WEIGHTING
     p.powf(miss_weight)
+    }
+
+    /// CC V3 Relax-only: accuracy-drop-based miss weighting.
+    ///
+    /// Ported from cheat-ccv3-pp. The idea: on Relax, 100s and 50s are a
+    /// cleaner signal than combo position for "was the miss in a genuinely
+    /// hard section?". We compute a weighted accuracy sum where 300s weigh
+    /// 1.0, 100s weigh 0.9, 50s weigh 0.85, then look at the average weight
+    /// per note to classify the map into "hard" (avg < 0.90) or "easy".
+    ///
+    /// Returns:
+    ///   0.75 if the map plays hard (miss likely justified → less punishing)
+    ///   0.50 if the map plays easy (miss likely a sloppy break → more punishing)
+    fn accuracy_drop_based_miss_weight(&self) -> f64 {
+        let total_hits = f64::from(self.state.total_hits());
+        if total_hits == 0.0 {
+            return 0.5;
+        }
+
+        // Weights: n300 = 1.0, n100 = 0.9, n50 = 0.85
+        let total_100 = f64::from(self.state.n100);
+        let total_50 = f64::from(self.state.n50);
+        let total_300 = f64::from(self.state.n300);
+
+        let actual_weighted_sum = total_300 * 1.0 + total_100 * 0.9 + total_50 * 0.85;
+
+        // Average weight per note in [0.85, 1.0] roughly
+        let avg_weight_per_note = (actual_weighted_sum / total_hits).min(1.0);
+
+        // Hardness heuristic: lots of 100s/50s means the map played hard,
+        // so the miss was probably in a legitimately difficult spot.
+        let is_hard_map = avg_weight_per_note < 0.90;
+
+        if is_hard_map {
+            0.75
+        } else {
+            0.50
+        }
     }
 
     fn compute_aim_value(&self) -> f64 {
