@@ -135,6 +135,34 @@ pub fn difficulty(
                 (deltas[m - 1] + deltas[m]) / 2.0
             };
         }
+
+        // CC V3 (Relax): hardness-per-4-notes for the RX miss system.
+        // Non-strain-based — pure timing. Each 4-note chunk's hardness
+        // is the sum of (1.0 / delta_time) across its four objects, so
+        // faster sections register as harder. The performance pass uses
+        // this to distribute the total n100/n50 drops across sections
+        // proportional to their hardness, then pair-up to 8-note windows
+        // and rank the pairs by estimated "accuracy drop weight".
+        let mut hardness_chunks: Vec<f64> = Vec::new();
+        let mut chunk_sum = 0.0;
+        let mut chunk_count: u32 = 0;
+        for obj in &speed_object_data {
+            if obj.delta_time > 0.0 {
+                chunk_sum += 1.0 / obj.delta_time;
+                chunk_count += 1;
+                if chunk_count == 4 {
+                    hardness_chunks.push(chunk_sum);
+                    chunk_sum = 0.0;
+                    chunk_count = 0;
+                }
+            }
+        }
+        // If a partial chunk remains (< 4 notes), push it anyway so the
+        // tail of the map isn't silently dropped.
+        if chunk_count > 0 {
+            hardness_chunks.push(chunk_sum);
+        }
+        attrs.rx_hardness_per_4notes = hardness_chunks;
     }
 
     Ok(attrs)

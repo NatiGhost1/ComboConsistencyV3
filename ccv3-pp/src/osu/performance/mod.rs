@@ -22,6 +22,8 @@ use super::{
 pub mod gradual;
 pub mod relax_marathon;
 pub mod speed_rework;
+pub mod rx_miss;
+pub mod ap_miss;
 
 use relax_marathon::{relax_marathon_multiplier, MarathonDecayParams};
 use speed_rework::{compute_autopilot_speed_multiplier, compute_vanilla_speed_multiplier, SpeedReworkParams};
@@ -956,82 +958,62 @@ impl OsuPerformanceInner<'_> {
         // Miss scaling: 0.95^n gives -5% per miss with a 0.45 floor at
         // ~17 misses. This is meaningfully harsher than the non-CSR
         // default (nothing) but gentler than CSR's stepped exponent model.
-        if self.mods.ap() && self.attrs.max_combo > 0 {
-            let combo_ratio = (f64::from(self.state.max_combo)
-                / f64::from(self.attrs.max_combo))
-            .clamp(0.0, 1.0);
-            let ap_combo_scale = (0.70 + 0.30 * combo_ratio.powf(0.65)).min(1.0);
+        // CC V3 (Autopilot): standalone miss system (see ap_miss.rs).
+        //
+        // AP has assisted aim, so the usual miss model doesn't fit well.
+        // This handles:
+        //   * real-miss combo scaling (applied ONLY to real misses)
+        //   * per-n50 extreme decay below OD 7.5 (capped at a floor for
+        //     2+ n50s — taps aren't real misses and shouldn't cascade)
+        //   * combo scaling deliberately does NOT apply to n50-derived
+        //     penalty — top tappers are still human
+        //
+        // Replaces the old exponential multiplier path on AP. The AP
+        // branch in apply_cc_v3_multiplier has been removed.
+        if self.mods.ap() {
+            let ap_mult = ap_miss::ap_miss_multiplier(
+                self.attrs.od,
+                self.state.n50,
+                self.state.misses,
+                self.state.max_combo,
+                self.attrs.max_combo,
+            );
 
-            let ap_miss_scale = if self.effective_miss_count > 0.0 {
-                0.95_f64
-                    .powf(self.effective_miss_count)
-                    .max(0.45)
-            } else {
-                1.0
-            };
-
-            let ap_scale = ap_combo_scale * ap_miss_scale;
-
-            pp *= ap_scale;
-            // aim_value is 0 on AP but include it defensively
-            aim_value *= ap_scale;
-            speed_value *= ap_scale;
-            acc_value *= ap_scale;
-            flashlight_value *= ap_scale;
+            pp *= ap_mult;
+            aim_value *= ap_mult;
+            speed_value *= ap_mult;
+            acc_value *= ap_mult;
+            flashlight_value *= ap_mult;
         }
 
-        // CC V3: Relax-only accuracy-drop based miss weighting.
+        // CC V3 (Relax): standalone miss system (see rx_miss.rs).
         //
-        // Ported from cheat-ccv3-pp. On Relax, the player has no tap timing,
-        // which means 100s and 50s are a much cleaner signal for "where on
-        // the difficulty spectrum did the miss happen" than combo position.
-        // This applies a small additional multiplier based on the map's
-        // effective hardness as measured by the weighted hit distribution.
+        // Distributes total n100 + n50 across 4-note chunks weighted by
+        // chunk hardness, combines into 8-note pairs, ranks the pairs by
+        // acc-drop-weight, and penalises the first miss based on whether
+        // it landed in a top-5-lowest-weight (most drops / hardest)
+        // section, a top-5-highest-weight (cleanest) section, or the
+        // middle. Subsequent misses use chunk-level granularity with
+        // per-miss damping based on map cleanliness.
         //
-        // Misses decay with each additional miss: first miss has full penalty,
-        // but subsequent misses apply diminishing penalties.
-        // When miss count exceeds 2, the penalty becomes much less extreme.
-        //
-        // Only runs when there is at least 1 miss, and only for Relax.
-        if self.mods.rx() && self.effective_miss_count > 0.0 {
-            let base_weight = self.accuracy_drop_based_miss_weight();
-            let num_misses = self.effective_miss_count.ceil() as u32;
-            let mut total_weight = 1.0;
+        // Replaces the old exponential multiplier path on RX. The RX
+        // branch in apply_cc_v3_multiplier has been removed.
+        if self.mods.rx() && self.state.misses > 0 {
+            let rx_mult = rx_miss::rx_miss_multiplier(
+                &self.attrs.rx_hardness_per_4notes,
+                self.state.n300,
+                self.state.n100,
+                self.state.n50,
+                self.state.misses,
+                self.state.max_combo,
+                self.attrs.max_combo,
+            );
 
-            // Decay strategy depends on miss count
-            if self.effective_miss_count > 2.0 {
-                // For 3+ misses: use much gentler decay (each miss adds 10% penalty, caps at moderate loss)
-                for i in 0..num_misses {
-                    let penalty_reduction = if i == 0 {
-                        (1.0 - base_weight) // First miss: full penalty based on map hardness
-                    } else {
-                        (1.0 - base_weight) * 0.10 // Subsequent misses: only 10% penalty each
-                    };
-                    let miss_weight = 1.0 - penalty_reduction;
-                    total_weight *= miss_weight;
-                }
-            } else {
-                // For 1-2 misses: use aggressive first decay (easy map 35%, hard map 15%)
-                for i in 0..num_misses {
-                    let decay_factor = if i == 0 {
-                        1.0 // First miss: full penalty
-                    } else if base_weight >= 0.72 {
-                        0.35 // Easy map: 35% of penalty for subsequent misses
-                    } else {
-                        0.15 // Hard map: 15% of penalty for subsequent misses
-                    };
-
-                    let penalty_reduction = (1.0 - base_weight) * decay_factor;
-                    let miss_weight = 1.0 - penalty_reduction;
-                    total_weight *= miss_weight;
-                }
-            }
-
-            pp *= total_weight;
-            aim_value *= total_weight;
-            speed_value *= total_weight;
-            acc_value *= total_weight;
-            flashlight_value *= total_weight;
+            pp *= rx_mult;
+            aim_value *= rx_mult;
+            speed_value *= rx_mult;
+            acc_value *= rx_mult;
+            flashlight_value *= rx_mult;
         }
 
         OsuPerformanceAttributes {
@@ -1052,15 +1034,19 @@ impl OsuPerformanceInner<'_> {
             return 1.0;
         }
 
+        // CC V3: RX and AP use their own standalone miss systems now
+        // (see rx_miss.rs and ap_miss.rs applied in calculate()). Skip
+        // the exponential pathway entirely for them — returning 1.0
+        // here means the CC V3 scale block becomes an identity for
+        // those mods and the real work happens in the standalone
+        // modules.
+        if self.mods.rx() || self.mods.ap() {
+            return 1.0;
+        }
+
         let map_max_combo = self.attrs.max_combo;
         let mut p = 0.998;
 
-        if self.mods.rx() {
-            p -= 0.02;
-        }
-        if self.mods.ap() {
-            p -= 0.05;
-        }
         if self.mods.dt() && self.mods.hr() {
             p += 0.0025;
         }
@@ -1072,9 +1058,6 @@ impl OsuPerformanceInner<'_> {
         }
         if map_max_combo <= 500 && self.mods.dt() && self.mods.hr() {
             p -= 0.01;
-        }
-        if map_max_combo <= 500 && self.mods.rx() {
-            p -= 0.03;
         }
 
         // Each miss becomes progressively more punishing.
@@ -1111,39 +1094,6 @@ impl OsuPerformanceInner<'_> {
 
         // * MISS WEIGHTING
         p.powf(miss_weight)
-    }
-
-    /// CC V3 Relax-only: accuracy-drop-based miss weighting.
-    ///
-    /// Ported from cheat-ccv3-pp. The idea: on Relax, 100s and 50s are a
-    /// cleaner signal than combo position for "was the miss in a genuinely
-    /// hard section?". We compute a weighted accuracy sum where 300s weigh
-    /// 1.0, 100s weigh 0.9, 50s weigh 0.85, then look at the average weight
-    /// per note to classify the map into "hard" (avg < 0.90) or "easy".
-    ///
-    /// Returns:
-    ///   0.75 if the map plays hard (miss likely justified → less punishing)
-    ///   0.50 if the map plays easy (miss likely a sloppy break → more punishing)
-    fn accuracy_drop_based_miss_weight(&self) -> f64 {
-        let total_hits = f64::from(self.state.total_hits());
-        if total_hits == 0.0 {
-            return 0.70;
-        }
-
-        // Weights: n300 = 1.0, n100 = 0.9, n50 = 0.85
-        let total_100 = f64::from(self.state.n100);
-        let total_50 = f64::from(self.state.n50);
-        let total_300 = f64::from(self.state.n300);
-
-        let actual_weighted_sum = total_300 * 1.0 + total_100 * 0.9 + total_50 * 0.85;
-
-        // Average weight per note in [0.85, 1.0] roughly
-        let avg_weight_per_note = (actual_weighted_sum / total_hits).min(1.0);
-
-        // Smooth gradient from 0.75 (hard map) to 0.70 (easy map)
-        // Maps avg_weight_per_note from [0.85, 1.0] to penalty [0.75, 0.70]
-        let penalty = 0.75 - (avg_weight_per_note - 0.85) / 3.0;
-        penalty.max(0.70)
     }
 
     fn compute_aim_value(&self) -> f64 {
