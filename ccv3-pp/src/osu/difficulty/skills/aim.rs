@@ -21,15 +21,19 @@ pub struct Aim {
     /// strain_value_at routes to AimRxEvaluator in aim_rx.rs instead
     /// of the vanilla AimEvaluator below.
     has_relax: bool,
+    /// CC V3: Circle size. Used by per-object CS+BPM farm nerf so
+    /// the check can happen inline without reaching back into attrs.
+    cs: f64,
     curr_strain: f64,
     inner: OsuStrainSkill,
 }
 
 impl Aim {
-    pub fn new(with_sliders: bool, has_relax: bool) -> Self {
+    pub fn new(with_sliders: bool, has_relax: bool, cs: f64) -> Self {
         Self {
             with_sliders,
             has_relax,
+            cs,
             curr_strain: 0.0,
             inner: OsuStrainSkill::default(),
         }
@@ -126,7 +130,12 @@ impl<'a> Skill<'a, Aim> {
                 self.inner.with_sliders,
             )
         } else {
-            AimEvaluator::evaluate_diff_of(curr, self.diff_objects, self.inner.with_sliders)
+            AimEvaluator::evaluate_diff_of(
+                curr,
+                self.diff_objects,
+                self.inner.with_sliders,
+                self.inner.cs,
+            )
         };
 
         self.inner.curr_strain += eval_result * SKILL_MULTIPLIER;
@@ -148,6 +157,7 @@ impl AimEvaluator {
         curr: &'a OsuDifficultyObject<'a>,
         diff_objects: &'a [OsuDifficultyObject<'a>],
         with_slider_travel_dist: bool,
+        cs: f64,
     ) -> f64 {
         let osu_curr_obj = curr;
 
@@ -299,6 +309,68 @@ impl AimEvaluator {
         // * Add in additional slider velocity bonus.
         if with_slider_travel_dist {
             aim_strain += slider_bonus * Self::SLIDER_MULTIPLIER;
+        }
+
+        // ═════════════════════════════════════════════════════════════
+        // CC V3: per-object farm nerfs (moved from performance/mod.rs).
+        //
+        // The old performance-layer versions used map-wide aggregates
+        // (attrs.avg_jump_dist, attrs.median_delta_time) which nerfed
+        // *everything* including varied/tech sections of an otherwise
+        // farm-shaped map. These per-object versions only fire when
+        // the object itself matches the farm profile, so a tech pattern
+        // embedded in a farm-BPM map won't get touched.
+        //
+        // Object-level indicators:
+        //   strain_time     → this object's own effective 1/2 delta (ms)
+        //   lazy_jump_dist  → this object's own jump distance
+        //
+        // Two nerfs applied multiplicatively:
+        //   1. CS + mid-BPM 1/2 nerf for small-circle lazy tapping
+        //   2. BPM-distance inflation nerf for mid-BPM big-jump farm
+        // ═════════════════════════════════════════════════════════════
+
+        let st = osu_curr_obj.strain_time;
+        let ljd = osu_curr_obj.lazy_jump_dist;
+
+        // ── 1. CS + mid-BPM 1/2 nerf ──────────────────────────────────
+        // Fires when THIS object's rhythm is in the 120–170 BPM 1/2
+        // band (strain_time 176–250ms) AND the map's CS is 4.6–6.4.
+        // Max cut: 10% at CS 5.5 + 145 BPM 1/2, tapered triangularly.
+        if st >= 176.0 && st <= 250.0 && cs >= 4.6 && cs <= 6.4 {
+            let cs_mid = 5.5;
+            let cs_half = 0.9;
+            let cs_t = 1.0 - ((cs - cs_mid).abs() / cs_half).min(1.0);
+
+            let bpm_1_2 = 30_000.0 / st;
+            let bpm_mid = 145.0;
+            let bpm_half = 25.0;
+            let bpm_t = 1.0 - ((bpm_1_2 - bpm_mid).abs() / bpm_half).min(1.0);
+
+            let cs_bpm_nerf = 1.0 - 0.10 * cs_t * bpm_t;
+            aim_strain *= cs_bpm_nerf;
+        }
+
+        // ── 2. BPM + distance inflation nerf ──────────────────────────
+        // Fires per-object when strain_time is in the 140–167 BPM 1/2
+        // band (178.6–214.3ms) AND this specific object's lazy_jump_dist
+        // is ≥ 180 px. Max cut: 12% at bpm_1_2 = 153.5 with jump ≥ 260.
+        //
+        // Critically: an object with high strain_time but varied
+        // neighbouring patterns won't trigger unless IT is the constant
+        // mid-BPM big jump. Tech maps with occasional big jumps no
+        // longer get map-wide taxed by this nerf.
+        if st >= 178.6 && st <= 214.3 && ljd >= 180.0 {
+            let bpm_1_2 = 30_000.0 / st;
+            let bpm_mid = 153.5;
+            let bpm_half = 13.5;
+            let bpm_t = 1.0 - ((bpm_1_2 - bpm_mid).abs() / bpm_half).min(1.0);
+
+            let dist_t = ((ljd - 180.0) / 80.0).clamp(0.0, 1.0);
+
+            let severity = bpm_t * dist_t;
+            let dist_inflation_nerf = 1.0 - 0.12 * severity;
+            aim_strain *= dist_inflation_nerf;
         }
 
         aim_strain

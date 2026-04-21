@@ -915,7 +915,7 @@ impl OsuPerformanceInner<'_> {
         let mut flashlight_value = flashlight_value;
 
         if let Some(p) = self.combo_consistency_v3_p {
-            let tax = short_map_tax(self.attrs.max_combo);
+            let tax = combo_ratio_tax(self.state.max_combo, self.attrs.max_combo);
             let s = self.apply_cc_v3_multiplier();
             let scale = tax * s;
 
@@ -924,6 +924,60 @@ impl OsuPerformanceInner<'_> {
             speed_value *= scale;
             acc_value *= scale;
             flashlight_value *= scale;
+        }
+
+        // CC V3: Autopilot combo scaling + miss scaling.
+        //
+        // Rationale: on Autopilot, aim is assisted (always returns 0 from
+        // compute_aim_value), so speed + acc + FL carry all the pp. The
+        // vanilla speed pipeline has no combo-position sensitivity at all,
+        // which makes AP scores barely react to combo position — a player
+        // can miss at 10% combo and lose almost nothing extra vs missing
+        // at 90% combo.
+        //
+        // This adds an AP-specific combo scaling on top of the existing
+        // miss penalty. It's *lighter* than the pre-CSR ccv3 multiplier
+        // (because CSR's consistency model is more appropriate) but
+        // *heavier* than the non-CSR baseline (which was basically zero
+        // for AP). When CSR is active this adds on top of the main CC V3
+        // scale for a slightly more punishing AP curve overall.
+        //
+        // Formula (applied to speed_value, acc_value, flashlight_value):
+        //
+        //   ap_combo_scale = 0.70 + 0.30 * combo_ratio^0.65
+        //   ap_miss_scale  = 0.95 ^ effective_miss_count   (floored at 0.45)
+        //
+        // combo_ratio^0.65 gives:
+        //   ratio=0.25 → 0.70+0.30*0.401 = 0.820 (-18.0%)
+        //   ratio=0.50 → 0.70+0.30*0.635 = 0.890 (-11.0%)
+        //   ratio=0.75 → 0.70+0.30*0.830 = 0.949 (-5.1%)
+        //   ratio=1.00 → 0.70+0.30*1.000 = 1.000 (no penalty on FC)
+        //
+        // Miss scaling: 0.95^n gives -5% per miss with a 0.45 floor at
+        // ~17 misses. This is meaningfully harsher than the non-CSR
+        // default (nothing) but gentler than CSR's stepped exponent model.
+        if self.mods.ap() && self.attrs.max_combo > 0 {
+            let combo_ratio = (f64::from(self.state.max_combo)
+                / f64::from(self.attrs.max_combo))
+            .clamp(0.0, 1.0);
+            let ap_combo_scale = (0.70 + 0.30 * combo_ratio.powf(0.65)).min(1.0);
+
+            let ap_miss_scale = if self.effective_miss_count > 0.0 {
+                0.95_f64
+                    .powf(self.effective_miss_count)
+                    .max(0.45)
+            } else {
+                1.0
+            };
+
+            let ap_scale = ap_combo_scale * ap_miss_scale;
+
+            pp *= ap_scale;
+            // aim_value is 0 on AP but include it defensively
+            aim_value *= ap_scale;
+            speed_value *= ap_scale;
+            acc_value *= ap_scale;
+            flashlight_value *= ap_scale;
         }
 
         // CC V3: Relax-only accuracy-drop based miss weighting.
@@ -1147,63 +1201,13 @@ impl OsuPerformanceInner<'_> {
             aim_value *= ar_band_nerf;
         }
 
-        // CC V3: CS 4.6–6.4 nerf for mid-BPM 1/2 tapping (120–170 BPM song
-        // BPM). Small circles at lazy tap speeds = a farm profile (small
-        // aim windows, slow enough to predict, OD carries the pp).
-        // 1/2 at 120 BPM → 250 ms delta; 1/2 at 170 BPM → 176 ms delta.
-        // median_delta_time is rate-adjusted, so DT play of a 120–170 song
-        // hits the same delta band.
-        if self.attrs.median_delta_time > 0.0 {
-            let md = self.attrs.median_delta_time;
-            let in_delta_band = md >= 176.0 && md <= 250.0;
-            let cs = self.attrs.cs;
-            if in_delta_band && cs >= 4.6 && cs <= 6.4 {
-                // CS triangle: 4.6→0, 5.5→1, 6.4→0
-                let cs_mid = 5.5;
-                let cs_half = 0.9;
-                let cs_t = 1.0 - ((cs - cs_mid).abs() / cs_half).min(1.0);
-
-                // BPM strength: full nerf around 145 BPM 1/2, less at edges
-                let bpm_1_2 = 30_000.0 / md;
-                let bpm_mid = 145.0;
-                let bpm_half = 25.0;
-                let bpm_t = 1.0 - ((bpm_1_2 - bpm_mid).abs() / bpm_half).min(1.0);
-
-                // Max cut: 10% at CS 5.5 + 145 BPM 1/2
-                let cs_bpm_nerf = 1.0 - 0.10 * cs_t * bpm_t;
-                aim_value *= cs_bpm_nerf;
-            }
-        }
-
-        // CC V3: BPM-based distance inflation nerf for 140–167 BPM nomod
-        // (and the equivalent DT range 210–250.5). Delta_time is
-        // rate-adjusted, so both nomod and DT of a 140–167 song collapse
-        // to the same delta band when interpreted as 1/2.
-        //
-        // bpm_1_2 = 30_000 / median_delta_time
-        // For bpm_1_2 ∈ [140, 167] → median_delta ∈ [179.64, 214.29]
-        //
-        // Combined with high average jump distance (≥180 osu!px avg), this
-        // catches the mid-BPM big-jump farm profile (Christmas Slop, Battle
-        // Tower etc). Triangle penalty peaking at bpm_1_2 = 153.5 and
-        // avg_jump_dist = 260 osu!px.
-        if self.attrs.median_delta_time > 0.0 && self.attrs.avg_jump_dist >= 180.0 {
-            let bpm_1_2 = 30_000.0 / self.attrs.median_delta_time;
-            if bpm_1_2 >= 140.0 && bpm_1_2 <= 167.0 {
-                // BPM triangle: 140→0, 153.5→1, 167→0
-                let bpm_mid = 153.5;
-                let bpm_half = 13.5;
-                let bpm_t = 1.0 - ((bpm_1_2 - bpm_mid).abs() / bpm_half).min(1.0);
-
-                // Distance triangle: 180→0, 260→1, 340+ saturates at 1
-                let dist_t = ((self.attrs.avg_jump_dist - 180.0) / 80.0).clamp(0.0, 1.0);
-
-                // Max cut: 12% at bpm_1_2 = 153.5 with avg_jump_dist ≥ 260
-                let severity = bpm_t * dist_t;
-                let dist_inflation_nerf = 1.0 - 0.12 * severity;
-                aim_value *= dist_inflation_nerf;
-            }
-        }
+        // CC V3 note: the CS+BPM 1/2 farm nerf and the BPM+distance
+        // inflation nerf that used to live here have been moved into
+        // AimEvaluator::evaluate_diff_of (see skills/aim.rs). They now
+        // fire per-object using each object's own strain_time and
+        // lazy_jump_dist, so a tech pattern embedded in a farm-BPM map
+        // won't get map-wide taxed — only objects that actually match
+        // the farm profile get cut.
 
         if self.mods.bl() {
             aim_value *= 1.3
@@ -1449,11 +1453,34 @@ fn total_imperfect_hits(state: &OsuScoreState) -> f64 {
     f64::from(state.n100 + state.n50 + state.misses)
 }
 
-// CC V3 short map tax. V1.1 uses denominator 250 (gentler than the
-// earlier +500 version) so short maps lose ~25–40% instead of 40–50%.
-fn short_map_tax(max_combo: u32) -> f64 {
-    let m = max_combo as f64;
-    0.5 + 0.5 * (m / (m + 250.0))
+// CC V3 combo-ratio tax. Replaces the old short_map_tax (which was
+// purely a function of map max_combo). This version looks at the
+// player's achieved combo ratio — a player who barely touched the
+// map pays more than one who played most of it — but the curve is
+// deliberately LIGHT (max ~15% cut) so it's not a second combo
+// scaling on top of the main miss scaling.
+//
+// Formula: 0.85 + 0.15 * (combo_ratio^0.35)
+//
+//   combo_ratio = player_max_combo / map_max_combo    ∈ [0, 1]
+//
+//   ratio=0.00 → 0.85 (-15% — barely played, minimum tax)
+//   ratio=0.10 → 0.92 (-8.3%)
+//   ratio=0.25 → 0.95 (-5.4%)
+//   ratio=0.50 → 0.97 (-3.4%)
+//   ratio=0.75 → 0.98 (-2.1%)
+//   ratio=1.00 → 1.00 (no tax — FC gets untaxed)
+//
+// Compared to the old short_map_tax(max_combo=500)=0.833 (-16.7%),
+// this is significantly lighter and also lets long-map play pass
+// through effectively untouched while short-run / partial-play is
+// still gently taxed.
+fn combo_ratio_tax(state_combo: u32, map_combo: u32) -> f64 {
+    if map_combo == 0 {
+        return 1.0;
+    }
+    let ratio = (f64::from(state_combo) / f64::from(map_combo)).clamp(0.0, 1.0);
+    (0.85 + 0.15 * ratio.powf(0.35)).min(1.0)
 }
 
 fn miss_factor(misses: u32, p: f64) -> f64 {
