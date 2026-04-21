@@ -957,7 +957,7 @@ impl OsuPerformanceInner<'_> {
                     total_weight *= miss_weight;
                 }
             } else {
-                // For 1-2 misses: use aggressive first decay (easy map 70%, hard map 35%)
+                // For 1-2 misses: use aggressive first decay (easy map 35%, hard map 15%)
                 for i in 0..num_misses {
                     let decay_factor = if i == 0 {
                         1.0 // First miss: full penalty
