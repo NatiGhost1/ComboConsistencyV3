@@ -46,13 +46,10 @@ impl OsuSkills {
         // CC V3: Relax gets a separate aim evaluator (see skills/aim_rx.rs).
         // Both aim skills receive the flag so the with_sliders and
         // no_sliders variants use the same evaluator path.
-        // CS is also passed through so the per-object CS+BPM farm nerf
-        // inside AimEvaluator can fire without reaching back into attrs.
         let has_relax = mods.rx();
-        let cs = map_attrs.cs;
 
-        let aim = Aim::new(true, has_relax, cs);
-        let aim_no_sliders = Aim::new(false, has_relax, cs);
+        let aim = Aim::new(true, has_relax);
+        let aim_no_sliders = Aim::new(false, has_relax);
         let speed = Speed::new(hit_window, mods);
         let flashlight = Flashlight::new(mods, scaling_factor.radius, time_preempt, time_fade_in);
 

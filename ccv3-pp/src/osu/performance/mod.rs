@@ -1201,13 +1201,43 @@ impl OsuPerformanceInner<'_> {
             aim_value *= ar_band_nerf;
         }
 
-        // CC V3 note: the CS+BPM 1/2 farm nerf and the BPM+distance
-        // inflation nerf that used to live here have been moved into
-        // AimEvaluator::evaluate_diff_of (see skills/aim.rs). They now
-        // fire per-object using each object's own strain_time and
-        // lazy_jump_dist, so a tech pattern embedded in a farm-BPM map
-        // won't get map-wide taxed — only objects that actually match
-        // the farm profile get cut.
+        // CC V3 note: the BPM+distance inflation nerf that used to live
+        // here has been removed. The CS+BPM nerf below is still map-wide
+        // (uses self.attrs.cs — the map's mod-adjusted circle size) but
+        // the delta band now fires when the map's overall pace matches
+        // mid-BPM 1/2 farm.
+        //
+        // CC V3: CS + mid-BPM 1/2 farm nerf. Small circles at lazy tap
+        // speed = small aim windows + predictable rhythm + OD carrying
+        // the pp = farm profile. Uses the map's CS (after HR/EZ) from
+        // attrs.cs, not per-object — CS is a map-wide property.
+        //
+        // Fires when:
+        //   attrs.median_delta_time ∈ [176, 250] ms   (120–170 BPM 1/2)
+        //   attrs.cs               ∈ [4.6, 6.4]
+        //
+        // Max cut: 10% at CS 5.5 + 145 BPM 1/2, tapered triangularly.
+        if self.attrs.median_delta_time > 0.0 {
+            let md = self.attrs.median_delta_time;
+            let in_delta_band = md >= 176.0 && md <= 250.0;
+            let cs = self.attrs.cs;
+            if in_delta_band && cs >= 4.6 && cs <= 6.4 {
+                // CS triangle: 4.6→0, 5.5→1, 6.4→0
+                let cs_mid = 5.5;
+                let cs_half = 0.9;
+                let cs_t = 1.0 - ((cs - cs_mid).abs() / cs_half).min(1.0);
+
+                // BPM strength: full at 145 BPM 1/2, tapered at edges
+                let bpm_1_2 = 30_000.0 / md;
+                let bpm_mid = 145.0;
+                let bpm_half = 25.0;
+                let bpm_t = 1.0 - ((bpm_1_2 - bpm_mid).abs() / bpm_half).min(1.0);
+
+                // Max cut: 10% at CS 5.5 + 145 BPM 1/2
+                let cs_bpm_nerf = 1.0 - 0.10 * cs_t * bpm_t;
+                aim_value *= cs_bpm_nerf;
+            }
+        }
 
         if self.mods.bl() {
             aim_value *= 1.3
