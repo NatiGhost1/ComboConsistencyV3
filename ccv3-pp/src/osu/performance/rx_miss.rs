@@ -1,51 +1,33 @@
-// CC V3 (Relax): acc-drop-weight-ranked miss penalty system.
+// CC V3 (Relax): acc-drop-weight ranked miss penalty system (v2).
 //
-// Concept
-// -------
-// The difficulty pass stores a list of hardness values, one per 4-note
-// chunk of the map. At performance time we:
+// Distributes total n100/n50 across 4-note chunks weighted by hardness,
+// combines into 8-note pairs, assigns each pair a continuous percentile
+// rank, then applies a smooth cubic penalty curve based on where each
+// miss falls in the distribution.
 //
-//   1. Distribute the player's total n100 + n50 counts across chunks
-//      proportional to hardness (harder chunks absorb more drops).
-//   2. Combine adjacent chunks into 8-note pairs (non-overlapping).
-//   3. For each pair, compute an "acc drop weight" ∈ [0.85, 1.0] —
-//      the weighted hit sum divided by the max possible. HIGHER weight
-//      means a cleaner pair; LOWER weight means more drops.
-//   4. Rank all pairs. Identify:
-//        - average weight across all pairs
-//        - top-5-lowest weight threshold (cleanest-5 boundary -> NO wait:
-//          LOWEST weight = MOST drops = HARDEST → that's the "lowest
-//          weight" group per the spec)
-//        - top-5-highest weight threshold (cleanest-5 boundary)
-//   5. For the first miss, locate the 8-note pair containing it (using
-//      state.max_combo / 8 as the position proxy), and compare that
-//      pair's weight against the thresholds:
-//          weight in lowest-5 bucket   → MAX penalty
-//          weight in highest-5 bucket  → MIN penalty
-//          else                        → linearly interpolated
-//   6. For subsequent misses, fall back to the 4-note chunk granularity
-//      and re-apply the same logic at chunk resolution.
-//
-// None of this is strain-based. It is driven entirely by object timing
-// (chunk hardness proxy) and score state (total n100/n50/miss counts
-// plus state.max_combo for miss-position approximation).
+// v2 over v1:
+//   * Continuous cubic penalty across the full percentile range — only
+//     the literal lowest-ranked pair hits absolute max penalty, only the
+//     literal highest hits absolute min. Everything in between is smooth.
+//   * Context factor: the pair BEFORE the miss pair is checked — if the
+//     player was already dropping accuracy, the miss is less surprising
+//     and the penalty is softened.
+//   * BPM-relative factor: if the miss pair is significantly faster than
+//     the map median delta, the miss is more justified → reduced penalty.
+//     If significantly slower, extra penalty.
+//   * Multi-miss: each subsequent miss is individually estimated to a
+//     chunk position (distributed across the map tail weighted by
+//     hardness) and scored at chunk-level percentile, with per-miss
+//     damping that depends on that specific chunk's ranking.
 
 /// Compute the RX miss penalty multiplier.
 ///
-/// Parameters:
-///   * `hardness_per_4notes` — the attrs field populated during the
-///     difficulty pass. One f64 per 4-note chunk.
-///   * `n300`, `n100`, `n50` — score-state totals.
-///   * `misses` — raw miss count.
-///   * `state_max_combo` — player's max combo (position proxy for first
-///     miss).
-///   * `map_max_combo` — map's max combo.
-///
-/// Returns a multiplier in roughly [0.40, 1.00] applied to pp.
-/// Returns 1.0 on 0 misses (FC passes through untouched).
+/// Returns [0.35, 1.00]. 1.0 on FC.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rx_miss_multiplier(
-    hardness_per_4notes: &[f64],
+    chunk_hardness: &[f64],
+    chunk_avg_delta: &[f64],
+    map_median_delta: f64,
     n300: u32,
     n100: u32,
     n50: u32,
@@ -56,139 +38,225 @@ pub(crate) fn rx_miss_multiplier(
     if misses == 0 {
         return 1.0;
     }
-    if hardness_per_4notes.is_empty() || map_max_combo == 0 {
-        // Degenerate / missing data: fall back to a flat modest penalty.
-        return 0.80_f64.powf(f64::from(misses)).max(0.45);
+    let chunks_n = chunk_hardness.len();
+    if chunks_n == 0 || map_max_combo == 0 {
+        return flat_fallback(misses);
     }
 
-    // --- Step 1: distribute drops across chunks ---------------------
-    let total_hardness: f64 = hardness_per_4notes.iter().sum();
+    // ── Step 1: distribute n100/n50 across chunks ───────────────────
+    let total_hardness: f64 = chunk_hardness.iter().sum();
     if total_hardness <= 0.0 {
-        return 0.80_f64.powf(f64::from(misses)).max(0.45);
+        return flat_fallback(misses);
     }
 
     let n100_f = f64::from(n100);
     let n50_f = f64::from(n50);
 
-    // drops_in_chunk[i] = (n100 + n50) share proportional to hardness[i]
-    // We keep n100 and n50 separately so weights stay accurate.
-    let chunks_n = hardness_per_4notes.len();
     let mut chunk_n100 = vec![0.0f64; chunks_n];
     let mut chunk_n50 = vec![0.0f64; chunks_n];
-    for (i, h) in hardness_per_4notes.iter().enumerate() {
+    for (i, h) in chunk_hardness.iter().enumerate() {
         let share = h / total_hardness;
         chunk_n100[i] = n100_f * share;
         chunk_n50[i] = n50_f * share;
     }
 
-    // --- Step 2: build 8-note pairs (non-overlapping) ---------------
-    // Pair i covers chunks [2i, 2i+1]. If an odd chunk remains at the
-    // end, it becomes a short pair on its own.
+    // ── Step 2: build non-overlapping 8-note pairs ──────────────────
     let pair_count = (chunks_n + 1) / 2;
-    let mut pair_weights = Vec::with_capacity(pair_count);
+    let mut pair_weights: Vec<f64> = Vec::with_capacity(pair_count);
+    let mut pair_avg_deltas: Vec<f64> = Vec::with_capacity(pair_count);
+
     for p in 0..pair_count {
         let i0 = 2 * p;
         let i1 = i0 + 1;
 
-        let (n_notes, pair_n100, pair_n50) = if i1 < chunks_n {
-            (8.0, chunk_n100[i0] + chunk_n100[i1], chunk_n50[i0] + chunk_n50[i1])
+        let (n_notes, p_n100, p_n50, avg_d) = if i1 < chunks_n {
+            (
+                8.0,
+                chunk_n100[i0] + chunk_n100[i1],
+                chunk_n50[i0] + chunk_n50[i1],
+                (chunk_avg_delta.get(i0).copied().unwrap_or(0.0)
+                    + chunk_avg_delta.get(i1).copied().unwrap_or(0.0))
+                    / 2.0,
+            )
         } else {
-            (4.0, chunk_n100[i0], chunk_n50[i0])
+            (
+                4.0,
+                chunk_n100[i0],
+                chunk_n50[i0],
+                chunk_avg_delta.get(i0).copied().unwrap_or(0.0),
+            )
         };
 
-        let pair_n300 = (n_notes - pair_n100 - pair_n50).max(0.0);
-        // Same weighting as accuracy_drop_based_miss_weight: 1.0 / 0.9 / 0.85
-        let weighted_sum = pair_n300 * 1.0 + pair_n100 * 0.9 + pair_n50 * 0.85;
-        let weight = (weighted_sum / n_notes).clamp(0.0, 1.0);
-        pair_weights.push(weight);
+        let p_n300 = (n_notes - p_n100 - p_n50).max(0.0);
+        let weighted_sum = p_n300 * 1.0 + p_n100 * 0.9 + p_n50 * 0.85;
+        pair_weights.push((weighted_sum / n_notes).clamp(0.0, 1.0));
+        pair_avg_deltas.push(avg_d);
     }
 
     if pair_weights.is_empty() {
-        return 0.80_f64.powf(f64::from(misses)).max(0.45);
+        return flat_fallback(misses);
     }
 
-    // --- Step 3: ranking ---------------------------------------------
-    // avg, plus thresholds for the "top 5 lowest weight" and "top 5
-    // highest weight" buckets.
-    let avg_weight: f64 = pair_weights.iter().sum::<f64>() / pair_weights.len() as f64;
+    // ── Step 3: percentile ranks (pairs) ────────────────────────────
+    let pair_percentile = percentile_ranks(&pair_weights);
 
-    let mut sorted_weights = pair_weights.clone();
-    sorted_weights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // ── Step 4: percentile ranks (chunks, for subsequent misses) ────
+    let mut chunk_weights: Vec<f64> = Vec::with_capacity(chunks_n);
+    for i in 0..chunks_n {
+        let c_n300 = (4.0 - chunk_n100[i] - chunk_n50[i]).max(0.0);
+        let ws = c_n300 * 1.0 + chunk_n100[i] * 0.9 + chunk_n50[i] * 0.85;
+        chunk_weights.push((ws / 4.0).clamp(0.0, 1.0));
+    }
+    let chunk_percentile = percentile_ranks(&chunk_weights);
 
-    // Lowest-5: the 5 smallest weights. Threshold = the 5th smallest.
-    // If there are fewer than 5 pairs, use min weight (every pair
-    // effectively qualifies).
-    let low_idx = 4.min(sorted_weights.len() - 1);
-    let lowest5_threshold = sorted_weights[low_idx];
-
-    // Highest-5: threshold = the 5th largest.
-    let high_idx = sorted_weights
-        .len()
-        .saturating_sub(5);
-    let highest5_threshold = sorted_weights[high_idx];
-
-    // --- Step 4: locate the first-miss pair --------------------------
-    let combo_ratio = (f64::from(state_max_combo) / f64::from(map_max_combo)).clamp(0.0, 1.0);
+    // ── Step 5: score the first miss ────────────────────────────────
+    let combo_ratio =
+        (f64::from(state_max_combo) / f64::from(map_max_combo)).clamp(0.0, 1.0);
     let miss_pair_idx = ((combo_ratio * pair_count as f64) as usize).min(pair_count - 1);
-    let first_miss_weight = pair_weights[miss_pair_idx];
 
-    // Per spec: a pair scoring "as the lowest weight (meaning more acc
-    // drop) use max penalty". So LOW weight = MAX penalty.
-    // Highest weight (cleanest) = MIN penalty.
-    //
-    // Scale from [lowest5_threshold, highest5_threshold] to [max_pen, min_pen].
-    const MAX_PENALTY: f64 = 0.50; // multiplier, so low value = harsh
-    const MIN_PENALTY: f64 = 0.85;
+    let first_pct = pair_percentile[miss_pair_idx];
+    let first_delta = pair_avg_deltas[miss_pair_idx];
 
-    let first_miss_mult = if first_miss_weight <= lowest5_threshold {
-        MAX_PENALTY
-    } else if first_miss_weight >= highest5_threshold {
-        MIN_PENALTY
-    } else {
-        // Linear interp. t=0 at lowest, t=1 at highest.
-        let range = (highest5_threshold - lowest5_threshold).max(1e-9);
-        let t = ((first_miss_weight - lowest5_threshold) / range).clamp(0.0, 1.0);
-        MAX_PENALTY + (MIN_PENALTY - MAX_PENALTY) * t
-    };
+    // Cubic ease-in-out mapping from percentile to penalty:
+    //   pct 0.0 (worst drops, lowest ranked) → MAX_PENALTY 0.45
+    //   pct 0.5 (median)                     → ~0.67
+    //   pct 1.0 (cleanest, highest ranked)   → MIN_PENALTY 0.88
+    const MAX_PENALTY: f64 = 0.45;
+    const MIN_PENALTY: f64 = 0.88;
 
-    // --- Step 5: subsequent misses — chunk granularity ---------------
-    // For misses beyond the first, use the 4-note chunks directly. Each
-    // extra miss applies a damped multiplicative penalty based on where
-    // *it* likely landed. Since we only know state.max_combo (the first
-    // break), we approximate additional miss positions as distributed
-    // across the map weighted by chunk hardness (harder chunks more
-    // likely to absorb misses too).
+    let t = cubic_ease(first_pct);
+    let mut first_mult = MAX_PENALTY + (MIN_PENALTY - MAX_PENALTY) * t;
+
+    // ── Context factor ──────────────────────────────────────────────
+    // If the PREVIOUS pair was also struggling (bottom 30%), soften
+    // penalty — the miss was a continuation of difficulty, not a fluke.
+    if miss_pair_idx > 0 {
+        let prev_pct = pair_percentile[miss_pair_idx - 1];
+        if prev_pct < 0.30 {
+            let relief = 0.08 * (1.0 - prev_pct / 0.30);
+            first_mult += relief;
+        }
+    }
+    // If the NEXT pair was also struggling, additional smaller relief
+    // (confirms the miss was in a sustained hard zone, not isolated).
+    if miss_pair_idx + 1 < pair_count {
+        let next_pct = pair_percentile[miss_pair_idx + 1];
+        if next_pct < 0.30 {
+            let relief = 0.04 * (1.0 - next_pct / 0.30);
+            first_mult += relief;
+        }
+    }
+
+    // ── BPM-relative factor ─────────────────────────────────────────
+    if map_median_delta > 0.0 && first_delta > 0.0 {
+        // speed_ratio > 1 = section is faster than map median
+        let speed_ratio = map_median_delta / first_delta;
+
+        if speed_ratio > 1.10 {
+            // Faster than normal → miss more justified → soften.
+            // Scales 0% at 1.10× up to 12% relief at 1.6×+.
+            let relief = ((speed_ratio - 1.10) / 0.50).clamp(0.0, 1.0) * 0.12;
+            first_mult += relief;
+        } else if speed_ratio < 0.90 {
+            // Slower than normal → miss less justified → harshen.
+            // Scales 0% at 0.90× down to 6% extra at 0.5×.
+            let extra = ((0.90 - speed_ratio) / 0.40).clamp(0.0, 1.0) * 0.06;
+            first_mult -= extra;
+        }
+    }
+
+    first_mult = first_mult.clamp(MAX_PENALTY, MIN_PENALTY);
+
+    // ── Step 6: subsequent misses — individually scored ──────────────
     let extra_misses = misses.saturating_sub(1);
-    let mut mult = first_miss_mult;
+    let mut mult = first_mult;
 
     if extra_misses > 0 {
-        // Per-chunk weight, same formula as pair weight but on 4-note.
-        let mut chunk_weights: Vec<f64> = Vec::with_capacity(chunks_n);
-        for i in 0..chunks_n {
-            let pair_n300 = (4.0 - chunk_n100[i] - chunk_n50[i]).max(0.0);
-            let weighted_sum = pair_n300 * 1.0 + chunk_n100[i] * 0.9 + chunk_n50[i] * 0.85;
-            chunk_weights.push((weighted_sum / 4.0).clamp(0.0, 1.0));
+        let first_chunk = ((combo_ratio * chunks_n as f64) as usize).min(chunks_n - 1);
+        let tail_hardness: f64 = chunk_hardness[first_chunk..].iter().sum();
+
+        let mut extra_applied = 0u32;
+        if tail_hardness > 0.0 {
+            for i in first_chunk..chunks_n {
+                if extra_applied >= extra_misses {
+                    break;
+                }
+                let share = chunk_hardness[i] / tail_hardness;
+                let misses_here =
+                    (f64::from(extra_misses) * share).round().max(0.0) as u32;
+                let misses_here = misses_here.min(extra_misses - extra_applied);
+
+                if misses_here > 0 {
+                    let cpct = chunk_percentile[i];
+                    let ct = cubic_ease(cpct);
+                    // Per-miss range: [0.86, 0.97]
+                    //   cpct 0.0 (hardest chunk) → 0.86 per miss (−14%)
+                    //   cpct 1.0 (easiest chunk) → 0.97 per miss (−3%)
+                    let per_miss = 0.86 + (0.97 - 0.86) * ct;
+
+                    // BPM adjustment for this specific chunk too
+                    let chunk_d = chunk_avg_delta.get(i).copied().unwrap_or(0.0);
+                    let bpm_adj = if map_median_delta > 0.0 && chunk_d > 0.0 {
+                        let sr = map_median_delta / chunk_d;
+                        if sr > 1.15 {
+                            // Faster → gentler per-miss
+                            1.0 + ((sr - 1.15) / 0.50).clamp(0.0, 1.0) * 0.03
+                        } else if sr < 0.85 {
+                            // Slower → harsher per-miss
+                            1.0 - ((0.85 - sr) / 0.35).clamp(0.0, 1.0) * 0.02
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    };
+
+                    let adjusted = (per_miss * bpm_adj).clamp(0.84, 0.98);
+                    mult *= adjusted.powf(f64::from(misses_here));
+                    extra_applied += misses_here;
+                }
+            }
         }
-        let chunk_avg: f64 =
-            chunk_weights.iter().sum::<f64>() / chunk_weights.len() as f64;
 
-        // Each extra miss:  mult *= subsequent_factor(chunk_avg)
-        // chunk_avg is the "typical section cleanliness". We use it as a
-        // gentle baseline — extra misses on a generally hard-playing map
-        // cost less per-miss than extra misses on an otherwise clean run.
-        //
-        //   chunk_avg 0.85 → 0.95 per extra miss
-        //   chunk_avg 1.00 → 0.88 per extra miss
-        let subsequent_factor = {
-            // t ∈ [0, 1] where 0 = dirty map, 1 = clean map
-            let t = ((chunk_avg - 0.85) / 0.15).clamp(0.0, 1.0);
-            // cleaner = harsher per miss
-            0.95 - 0.07 * t
-        };
-
-        mult *= subsequent_factor.powf(f64::from(extra_misses));
+        // Unplaced remainder gets flat mild penalty
+        if extra_applied < extra_misses {
+            let rem = extra_misses - extra_applied;
+            mult *= 0.92_f64.powf(f64::from(rem));
+        }
     }
 
-    // Floor at 0.40 so extreme runs don't zero out.
-    mult.max(0.40)
+    mult.max(0.35)
+}
+
+/// Cubic ease-in-out: steeper at extremes, flatter in middle.
+/// Input [0, 1] → output [0, 1].
+fn cubic_ease(x: f64) -> f64 {
+    if x < 0.5 {
+        4.0 * x * x * x
+    } else {
+        1.0 - (-2.0 * x + 2.0).powi(3) / 2.0
+    }
+}
+
+/// Assign percentile rank to each element. 0.0 = lowest, 1.0 = highest.
+fn percentile_ranks(values: &[f64]) -> Vec<f64> {
+    let n = values.len();
+    if n <= 1 {
+        return vec![0.5; n];
+    }
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&a, &b| {
+        values[a]
+            .partial_cmp(&values[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut ranks = vec![0.0f64; n];
+    for (rank, &idx) in indices.iter().enumerate() {
+        ranks[idx] = rank as f64 / (n - 1) as f64;
+    }
+    ranks
+}
+
+fn flat_fallback(misses: u32) -> f64 {
+    0.80_f64.powf(f64::from(misses)).max(0.40)
 }
