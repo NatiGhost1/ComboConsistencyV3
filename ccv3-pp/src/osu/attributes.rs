@@ -56,13 +56,12 @@ pub struct OsuDifficultyAttributes {
     pub local_sr_per_minute: Vec<f64>,
     pub avg_jump_dist: f64,
     pub median_delta_time: f64,
-    /// CC V3 (Relax): hardness proxy per 4-note chunk. Each value is the
-    /// sum of (1.0 / delta_time) across the 4 notes — higher = faster /
-    /// harder section, used to distribute estimated n100/n50 drops to the
-    /// sections where they most likely occurred. Rate-adjusted (clock rate
-    /// already applied upstream). Non-strain-based; computed directly from
-    /// hit-object timing.
-    pub rx_hardness_per_4notes: Vec<f64>,
+    /// CC V3 (RX/AP): hardness proxy per 4-note chunk. Each value is
+    /// Σ(1.0 / delta_time) across the 4 notes. Higher = faster/harder.
+    pub rx_chunk_hardness: Vec<f64>,
+    /// CC V3 (RX/AP): average delta_time (ms) per 4-note chunk.
+    /// Used by AP for BPM-relative miss weighting.
+    pub rx_chunk_avg_delta: Vec<f64>,
 }
 
 impl OsuDifficultyAttributes {
