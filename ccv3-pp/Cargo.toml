@@ -1,6 +1,6 @@
 [package]
 name = "combo-consistency"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 authors = ["MaxOhn <ohn.m@hotmail.de>", "tsunyoku <tsunyoku@gmail.com>", "NatiGhost1 <josh.miller83@outlook.com>"]
 license = "MIT"
