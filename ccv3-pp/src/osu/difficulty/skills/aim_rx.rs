@@ -165,7 +165,7 @@ impl AimRxEvaluator {
     // avg_dist ≥ 120 px: completely exempt (spaced, follow points)
     // in between:        linear taper
     const FLOW_DIST_FULL_NERF: f64 = 50.0;
-    const FLOW_DIST_EXEMPT: f64 = 120.0;
+    const FLOW_DIST_EXEMPT: f64 = 97.0;
 
     pub fn evaluate_diff_of<'a>(
         curr: &'a OsuDifficultyObject<'a>,
