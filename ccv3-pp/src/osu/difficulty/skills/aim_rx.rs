@@ -72,6 +72,34 @@ fn windowed_angle_stats<'a>(
     (mean, stddev, n)
 }
 
+/// Average lazy_jump_dist over a lookback window. Returns (mean_dist, count).
+/// Used by the flow nerf to distinguish close-together flow (no follow
+/// points, trivial on RX) from spaced-stream flow (follow points visible,
+/// requires real cursor speed even on RX).
+fn windowed_dist_mean<'a>(
+    curr: &'a OsuDifficultyObject<'a>,
+    diff_objects: &'a [OsuDifficultyObject<'a>],
+    window: usize,
+) -> (f64, usize) {
+    let mut dists: Vec<f64> = Vec::with_capacity(window + 1);
+    dists.push(curr.lazy_jump_dist);
+
+    for back in 0..window {
+        if let Some(prev) = curr.previous(back, diff_objects) {
+            dists.push(prev.lazy_jump_dist);
+        } else {
+            break;
+        }
+    }
+
+    let n = dists.len();
+    if n == 0 {
+        return (0.0, 0);
+    }
+    let mean = dists.iter().sum::<f64>() / n as f64;
+    (mean, n)
+}
+
 impl AimRxEvaluator {
     // Base multipliers. Slightly uplifted from vanilla (1.45/1.90/1.35/0.70)
     // to reward aim-control playstyles on RX.
@@ -123,6 +151,21 @@ impl AimRxEvaluator {
     // Extreme flow nerf: max cut on aim strain when flow signature is
     // fully matched (stddev at 0, mean at π). −50% at worst case.
     const FLOW_MAX_NERF: f64 = 0.50;
+
+    // Distance gating for flow nerf. The nerf targets patterns WITHOUT
+    // follow points — close-together flow where the cursor traces a
+    // gentle arc with minimal movement. These are the overweighted
+    // ones on RX because the cursor barely has to move.
+    //
+    // Spaced-stream flow (high distance between objects, follow points
+    // visible) requires real cursor speed even on RX and should NOT be
+    // nerfed.
+    //
+    // avg_dist ≤ 50 px:  full nerf applies (close together, no follow points)
+    // avg_dist ≥ 120 px: completely exempt (spaced, follow points)
+    // in between:        linear taper
+    const FLOW_DIST_FULL_NERF: f64 = 50.0;
+    const FLOW_DIST_EXEMPT: f64 = 120.0;
 
     pub fn evaluate_diff_of<'a>(
         curr: &'a OsuDifficultyObject<'a>,
@@ -326,22 +369,26 @@ impl AimRxEvaluator {
             }
         }
 
-        // ── Extreme flow aim nerf ──────────────────────────────────
+        // ── Extreme flow aim nerf (distance-gated) ────────────────────
         //
         // Flow aim = smooth sweeping motion through gentle curves, all
-        // at similar wide angles. On RX this is trivial (no tap timing
-        // to hit, just move cursor along a path). Detected via the
-        // windowed angle stats:
-        //   - mean angle above ~115° (wide sweeping, not sharp turns)
-        //   - stddev below ~17° (consistent curve direction)
+        // at similar wide angles. On RX this is trivial when the objects
+        // are close together (no follow points — cursor just traces a
+        // path with minimal movement). BUT when objects are spaced out
+        // (follow points visible), the flow pattern requires genuine
+        // cursor speed and should NOT be nerfed.
         //
-        // When both hold, apply an extreme multiplicative nerf.
-        // Severity scales with how tight the flow signature is:
-        //   - stddev → 0 (perfectly smooth curve) + mean → π  = full −50%
-        //   - stddev at threshold or mean at threshold = no nerf
+        // Detection via windowed angle stats:
+        //   - mean angle ≥ ~115° (wide sweeping, not sharp turns)
+        //   - stddev ≤ ~17° (consistent curve direction)
         //
-        // Exempt above 410 BPM 1/4 effective — at that speed, flow is
-        // actually mechanically hard to execute on RX.
+        // Distance gate via windowed_dist_mean:
+        //   - avg_dist ≤ 50 px: full nerf (close flow, no follow points)
+        //   - avg_dist ≥ 120 px: exempt (spaced flow, follow points)
+        //   - between: linear taper
+        //
+        // Exempt above 410 BPM 1/4 effective — at that speed, even
+        // close-together flow is mechanically hard on RX.
         if osu_curr_obj.strain_time >= Self::FLOW_CONSTANT_DIST_BPM_STRAIN_TIME {
             let (flow_mean, flow_stddev, flow_n) =
                 windowed_angle_stats(osu_curr_obj, diff_objects, Self::ANGLE_WINDOW);
@@ -351,19 +398,35 @@ impl AimRxEvaluator {
                 let stddev_ok = flow_stddev <= Self::FLOW_STDDEV_THRESHOLD;
 
                 if mean_ok && stddev_ok {
-                    // Stddev severity: 1.0 when stddev=0, 0.0 at threshold.
-                    // Squared so the curve bites harder on very tight flow.
+                    // Angle-based severity (unchanged)
                     let stddev_severity =
                         (1.0 - (flow_stddev / Self::FLOW_STDDEV_THRESHOLD)).powi(2);
 
-                    // Mean severity: 0.0 at the threshold (~115°), 1.0 at
-                    // π (~180°, perfectly straight-through sweep).
                     let mean_range = PI - Self::FLOW_MEAN_ANGLE_THRESHOLD;
                     let mean_severity = ((flow_mean - Self::FLOW_MEAN_ANGLE_THRESHOLD)
                         / mean_range)
                         .clamp(0.0, 1.0);
 
-                    let combined_severity = stddev_severity * mean_severity;
+                    let angle_severity = stddev_severity * mean_severity;
+
+                    // Distance gate: how much of the nerf actually applies.
+                    // Close-together = full nerf. Spaced = exempt.
+                    let (avg_dist, dist_n) =
+                        windowed_dist_mean(osu_curr_obj, diff_objects, Self::ANGLE_WINDOW);
+
+                    let dist_factor = if dist_n < 3 {
+                        0.5 // not enough data, apply half
+                    } else if avg_dist <= Self::FLOW_DIST_FULL_NERF {
+                        1.0 // close together: full nerf
+                    } else if avg_dist >= Self::FLOW_DIST_EXEMPT {
+                        0.0 // spaced out: fully exempt
+                    } else {
+                        // Linear taper between thresholds
+                        1.0 - ((avg_dist - Self::FLOW_DIST_FULL_NERF)
+                            / (Self::FLOW_DIST_EXEMPT - Self::FLOW_DIST_FULL_NERF))
+                    };
+
+                    let combined_severity = angle_severity * dist_factor;
                     let flow_nerf = 1.0 - Self::FLOW_MAX_NERF * combined_severity;
                     aim_strain *= flow_nerf;
                 }
