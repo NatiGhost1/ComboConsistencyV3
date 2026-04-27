@@ -458,7 +458,7 @@ impl TaikoPerformanceInner<'_> {
         diff_value *= 0.986_f64.powf(effective_miss_count);
 
         if self.mods.ez() {
-            diff_value *= 0.9;
+            diff_value = 1.0;
         }
 
         if self.mods.hd() {
