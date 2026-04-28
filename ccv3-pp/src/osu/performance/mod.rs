@@ -21,11 +21,13 @@ use super::{
 
 pub mod gradual;
 pub mod relax_marathon;
+pub mod auto_marathon;
 pub mod speed_rework;
 pub mod rx_miss;
 pub mod ap_miss;
 
 use relax_marathon::{relax_marathon_multiplier, MarathonDecayParams};
+use auto_marathon::{autopilot_marathon_multiplier, AutopilotDecayParams};
 use speed_rework::{compute_autopilot_speed_multiplier, compute_vanilla_speed_multiplier, SpeedReworkParams};
 
 /// Performance calculator on osu!standard maps.
@@ -899,6 +901,23 @@ impl OsuPerformanceInner<'_> {
             let mult = relax_marathon_multiplier(&self.attrs.local_sr_per_minute, params);
 
             aim_value *= mult;
+            flashlight_value *= mult;
+        }
+
+        if self.mods.ap() {
+            let params = AutopilotDecayParams {
+                tau: 1.0,
+                b: 0.05,
+                q: 1.40,
+                double_at: 3,
+            };
+
+            // CC V3: ap_local_sr_per_minute was precomputed in the difficulty
+            // pipeline (difficulty/mod.rs::difficulty()). autopilot_marathon_multiplier
+            // returns 1.0 for maps under ~1 minute (len < 2), so short maps are
+            // automatically a no-op.
+            let mult = autopilot_marathon_multiplier(&self.attrs.ap_local_sr_per_minute, params);
+
             speed_value *= mult;
             flashlight_value *= mult;
         }

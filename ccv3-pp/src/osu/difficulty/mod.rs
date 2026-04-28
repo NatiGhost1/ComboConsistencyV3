@@ -101,6 +101,14 @@ pub fn difficulty(
         &speed_peaks,
     );
 
+    // CC V3: Bin aim+speed section peaks into per-minute local SR for the
+    // autopilot marathon decay. Stored on attrs so performance/mod.rs can
+    // read it directly without needing skill access.
+    attrs.ap_local_sr_per_minute = crate::osu::performance::auto_marathon::ap_local_sr_per_minute(
+        &aim_peaks,
+        &speed_peaks,
+    );
+
     // CC V3: Compute average jump distance and median delta time across
     // all diff objects. Both are rate-adjusted (clock_rate already applied
     // upstream). Used by the distance inflation nerf in compute_aim_value.
