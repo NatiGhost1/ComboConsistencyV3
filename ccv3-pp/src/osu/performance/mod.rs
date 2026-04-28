@@ -1140,7 +1140,6 @@ impl OsuPerformanceInner<'_> {
                 self.misses,
                 self.attrs.aim_difficult_strain_count,
             );
-            // ^ Calculates all 4-mod scores using raw misses instead of effective misses ^ //
         }
 
         let ar_factor = if self.mods.rx() {
